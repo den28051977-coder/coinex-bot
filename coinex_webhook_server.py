@@ -93,7 +93,7 @@ def close_position(symbol):
         "market_type":    "FUTURES",
         "side":           side,
         "type":           "market",
-        "amount":         str(pos["amount"]),
+        "amount":         str(pos.get("close_avbl", pos.get("open_interest", "0"))),
         "close_position": True
     })
 
