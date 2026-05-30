@@ -1,6 +1,5 @@
 """
-CoinEx Futures Webhook Server v3
-Подпись: METHOD + /v2/path + body + timestamp
+CoinEx Futures Webhook Server v4 — с детальным логированием
 """
 
 import os, hmac, hashlib, time, json, requests
@@ -17,13 +16,7 @@ LEVERAGE      = int(os.environ.get("LEVERAGE", "10"))
 BASE_URL = "https://api.coinex.com"
 
 def sign_request(method, path, body=""):
-    """
-    CoinEx v2 подпись:
-    signed_str = METHOD + /v2/path + body + timestamp
-    signature  = HMAC-SHA256(secret_key, signed_str).hexdigest()
-    """
     timestamp = str(int(time.time() * 1000))
-    # path уже содержит /v2/... — подписываем полный путь
     sign_str  = method.upper() + path + body + timestamp
     signature = hmac.new(
         API_SECRET.encode("latin-1"),
@@ -42,6 +35,7 @@ def api_post(path, payload):
     body      = json.dumps(payload, separators=(",", ":"))
     headers   = sign_request("POST", full_path, body)
     r = requests.post(BASE_URL + full_path, headers=headers, data=body, timeout=10)
+    print(f"  POST {full_path} → {r.status_code}: {r.text[:300]}")
     return r.json()
 
 def api_get(path, params=None):
@@ -50,7 +44,26 @@ def api_get(path, params=None):
     full_path = "/v2" + path + ("?" + query if query else "")
     headers   = sign_request("GET", full_path, "")
     r = requests.get(BASE_URL + full_path, headers=headers, timeout=10)
+    print(f"  GET {full_path} → {r.status_code}: {r.text[:300]}")
     return r.json()
+
+def get_position(symbol):
+    # Пробуем оба варианта endpoint
+    r = api_get("/futures/pending-position", {"market": symbol, "market_type": "FUTURES"})
+    print(f"  get_position raw: {json.dumps(r)[:400]}")
+    if r.get("code") == 0:
+        data = r.get("data", {})
+        # Проверяем разные форматы ответа
+        if isinstance(data, list):
+            for p in data:
+                if p.get("market") == symbol:
+                    return p
+        elif isinstance(data, dict):
+            pos_list = data.get("position_list", data.get("positions", []))
+            for p in pos_list:
+                if p.get("market") == symbol:
+                    return p
+    return None
 
 def set_leverage(symbol, leverage):
     return api_post("/futures/adjust-position-leverage", {
@@ -59,14 +72,6 @@ def set_leverage(symbol, leverage):
         "leverage":      str(leverage),
         "position_side": "both"
     })
-
-def get_position(symbol):
-    r = api_get("/futures/pending-position", {"market": symbol, "market_type": "FUTURES"})
-    if r.get("code") == 0:
-        for p in r.get("data", {}).get("position_list", []):
-            if p.get("market") == symbol:
-                return p
-    return None
 
 def place_order(symbol, side, amount):
     set_leverage(symbol, LEVERAGE)
@@ -106,7 +111,7 @@ def webhook():
     lots   = int(data.get("lots", 1))
     amount = round(LOT_SIZE * lots, 4)
 
-    print(f"[{time.strftime('%H:%M:%S')}] {action} | {symbol} | lots={lots} | amount={amount}")
+    print(f"\n[{time.strftime('%H:%M:%S')}] ACTION={action} | {symbol} | lots={lots} | amount={amount}")
 
     if action == "buy":
         result = place_order(symbol, "buy", amount)
@@ -124,12 +129,18 @@ def webhook():
     else:
         return jsonify({"error": f"unknown action: {action}"}), 400
 
-    print(f"  CoinEx ответ: {result}")
+    print(f"  ИТОГ: {result}")
     return jsonify({"ok": True, "result": result})
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "server": "CoinEx Webhook v3"})
+    return jsonify({"status": "ok", "server": "CoinEx Webhook v4"})
+
+# Тестовый endpoint для проверки позиции
+@app.route("/position/<symbol>", methods=["GET"])
+def check_position(symbol):
+    pos = get_position(symbol.upper())
+    return jsonify({"position": pos})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
