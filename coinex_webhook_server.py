@@ -8,6 +8,7 @@ from collections import deque
 from datetime import datetime, timezone
 
 app = Flask(__name__)
+CORS(app)
 
 # CORS — разрешаем запросы отовсюду для /signals
 @app.after_request
