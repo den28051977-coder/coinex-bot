@@ -1,9 +1,11 @@
 """
-CoinEx Futures Webhook Server v4 — с детальным логированием
+CoinEx Futures Webhook Server v5 — с журналом сигналов
 """
 
 import os, hmac, hashlib, time, json, requests
 from flask import Flask, request, jsonify
+from collections import deque
+from datetime import datetime, timezone
 
 app = Flask(__name__)
 
@@ -14,6 +16,34 @@ LOT_SIZE      = float(os.environ.get("LOT_SIZE", "0.1"))
 LEVERAGE      = int(os.environ.get("LEVERAGE", "10"))
 
 BASE_URL = "https://api.coinex.com"
+
+# === ЖУРНАЛ СИГНАЛОВ — хранит последние 200 сигналов ===
+signals_log = deque(maxlen=200)
+
+def log_signal(data, result, filled_price=None):
+    """Записываем каждый сигнал в журнал"""
+    entry = {
+        "time":        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "action":      data.get("action", ""),
+        "symbol":      data.get("symbol", ""),
+        "lots":        data.get("lots", 1),
+        "signal":      data.get("signal", ""),
+        "trend":       data.get("trend", ""),
+        "mode":        data.get("mode", ""),
+        "avg":         data.get("avg", ""),
+        "filled_price": filled_price,
+        "result":      "ok" if isinstance(result, dict) and result.get("code") == 0 else str(result.get("msg", result)),
+        "pnl":         None
+    }
+    # Извлекаем PNL из результата биржи
+    if isinstance(result, dict) and result.get("code") == 0:
+        pnl = result.get("data", {}).get("realized_pnl")
+        if pnl:
+            entry["pnl"] = float(pnl)
+        fp = result.get("data", {}).get("last_filled_price")
+        if fp:
+            entry["filled_price"] = float(fp)
+    signals_log.append(entry)
 
 def sign_request(method, path, body=""):
     timestamp = str(int(time.time() * 1000))
@@ -48,12 +78,10 @@ def api_get(path, params=None):
     return r.json()
 
 def get_position(symbol):
-    # Пробуем оба варианта endpoint
     r = api_get("/futures/pending-position", {"market": symbol, "market_type": "FUTURES"})
     print(f"  get_position raw: {json.dumps(r)[:400]}")
     if r.get("code") == 0:
         data = r.get("data", {})
-        # Проверяем разные форматы ответа
         if isinstance(data, list):
             for p in data:
                 if p.get("market") == symbol:
@@ -130,17 +158,32 @@ def webhook():
         return jsonify({"error": f"unknown action: {action}"}), 400
 
     print(f"  ИТОГ: {result}")
+
+    # Логируем сигнал в журнал
+    log_signal(data, result)
+
     return jsonify({"ok": True, "result": result})
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "server": "CoinEx Webhook v4"})
+    return jsonify({"status": "ok", "server": "CoinEx Webhook v5"})
 
-# Тестовый endpoint для проверки позиции
 @app.route("/position/<symbol>", methods=["GET"])
 def check_position(symbol):
     pos = get_position(symbol.upper())
     return jsonify({"position": pos})
+
+# === НОВЫЙ ЭНДПОИНТ — журнал сигналов ===
+@app.route("/signals", methods=["GET"])
+def get_signals():
+    """Отдаёт историю сигналов. Доступно без токена для дашборда."""
+    limit = int(request.args.get("limit", 50))
+    signals = list(signals_log)[-limit:]
+    signals.reverse()  # Новые сверху
+    return jsonify({
+        "count": len(signals),
+        "signals": signals
+    })
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
