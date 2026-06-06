@@ -9,6 +9,18 @@ from datetime import datetime, timezone
 
 app = Flask(__name__)
 
+# CORS — разрешаем запросы отовсюду для /signals
+@app.after_request
+def add_cors(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    return response
+
+@app.route('/signals', methods=['OPTIONS'])
+def signals_options():
+    return '', 204
+
 API_KEY       = os.environ.get("COINEX_API_KEY", "")
 API_SECRET    = os.environ.get("COINEX_API_SECRET", "")
 WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "mytoken123")
