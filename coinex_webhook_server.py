@@ -8,7 +8,6 @@ from collections import deque
 from datetime import datetime, timezone
 
 app = Flask(__name__)
-CORS(app)
 
 # CORS — разрешаем запросы отовсюду для /signals
 @app.after_request
@@ -150,7 +149,9 @@ def webhook():
     action = data.get("action", "").lower()
     symbol = data.get("symbol", "SOLUSDT").upper()
     lots   = int(data.get("lots", 1))
-    amount = round(LOT_SIZE * lots, 4)
+    # Всегда открываем один лот = LOT_SIZE, независимо от lots
+    # lots используется только для информации в логах
+    amount = LOT_SIZE  # фиксированный размер одного добора
 
     print(f"\n[{time.strftime('%H:%M:%S')}] ACTION={action} | {symbol} | lots={lots} | amount={amount}")
 
