@@ -165,7 +165,8 @@ def webhook():
         pos = get_position(symbol)
         if pos:
             side = "sell" if pos["side"] == "long" else "buy"
-            result = place_order(symbol, side, amount)
+            # Выгружаем всегда один лот = LOT_SIZE
+            result = place_order(symbol, side, LOT_SIZE)
         else:
             result = {"msg": "нет позиции для выгрузки"}
     else:
