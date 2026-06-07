@@ -108,10 +108,9 @@ def get_position(symbol):
 
 def set_leverage(symbol, leverage):
     return api_post("/futures/adjust-position-leverage", {
-        "market":        symbol,
-        "market_type":   "FUTURES",
-        "leverage":      str(leverage),
-        "position_side": "both"
+        "market":      symbol,
+        "market_type": "FUTURES",
+        "leverage":    str(leverage),
     })
 
 def place_order(symbol, side, amount, reduce_only=False):
