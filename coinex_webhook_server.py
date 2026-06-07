@@ -90,7 +90,8 @@ def api_get(path, params=None):
     return r.json()
 
 def get_position(symbol):
-    r = api_get("/futures/pending-position", {"market": symbol, "market_type": "FUTURES"})
+    # opened-position = активные позиции (pending-position = ожидающие)
+    r = api_get("/futures/opened-position", {"market": symbol, "market_type": "FUTURES"})
     print(f"  get_position raw: {json.dumps(r)[:400]}")
     if r.get("code") == 0:
         data = r.get("data", {})
@@ -113,15 +114,18 @@ def set_leverage(symbol, leverage):
         "position_side": "both"
     })
 
-def place_order(symbol, side, amount):
-    set_leverage(symbol, LEVERAGE)
-    return api_post("/futures/order", {
+def place_order(symbol, side, amount, reduce_only=False):
+    # leverage устанавливается один раз при старте — не здесь
+    payload = {
         "market":      symbol,
         "market_type": "FUTURES",
         "side":        side,
         "type":        "market",
         "amount":      str(amount),
-    })
+    }
+    if reduce_only:
+        payload["is_close"] = True  # CoinEx v2: уменьшает позицию, не переворачивает
+    return api_post("/futures/order", payload)
 
 def close_position(symbol):
     pos = get_position(symbol)
@@ -165,8 +169,8 @@ def webhook():
         pos = get_position(symbol)
         if pos:
             side = "sell" if pos["side"] == "long" else "buy"
-            # Выгружаем всегда один лот = LOT_SIZE
-            result = place_order(symbol, side, LOT_SIZE)
+            # reduce_only=True — только уменьшает позицию, не переворачивает
+            result = place_order(symbol, side, LOT_SIZE, reduce_only=True)
         else:
             result = {"msg": "нет позиции для выгрузки"}
     else:
@@ -203,4 +207,10 @@ def get_signals():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"Сервер запущен на порту {port}")
+    # Устанавливаем плечо один раз при старте
+    try:
+        lev_result = set_leverage("SOLUSDT", LEVERAGE)
+        print(f"Плечо установлено: {lev_result}")
+    except Exception as e:
+        print(f"Ошибка установки плеча: {e}")
     app.run(host="0.0.0.0", port=port)
