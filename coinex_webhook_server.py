@@ -33,21 +33,19 @@ BASE_URL = "https://api.coinex.com"
 signals_log = deque(maxlen=200)
 
 def log_signal(data, result, filled_price=None):
-    """Записываем каждый сигнал в журнал"""
     entry = {
-        "time":        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "action":      data.get("action", ""),
-        "symbol":      data.get("symbol", ""),
-        "lots":        data.get("lots", 1),
-        "signal":      data.get("signal", ""),
-        "trend":       data.get("trend", ""),
-        "mode":        data.get("mode", ""),
-        "avg":         data.get("avg", ""),
+        "time":         datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "action":       data.get("action", ""),
+        "symbol":       data.get("symbol", ""),
+        "lots":         data.get("lots", 1),
+        "signal":       data.get("signal", ""),
+        "trend":        data.get("trend", ""),
+        "mode":         data.get("mode", ""),
+        "avg":          data.get("avg", ""),
         "filled_price": filled_price,
-        "result":      "ok" if isinstance(result, dict) and result.get("code") == 0 else str(result.get("msg", result)),
-        "pnl":         None
+        "result":       "ok" if isinstance(result, dict) and result.get("code") == 0 else str(result.get("msg", result)),
+        "pnl":          None
     }
-    # Извлекаем PNL из результата биржи
     if isinstance(result, dict) and result.get("code") == 0:
         pnl = result.get("data", {}).get("realized_pnl")
         if pnl:
@@ -60,9 +58,10 @@ def log_signal(data, result, filled_price=None):
 def sign_request(method, path, body=""):
     timestamp = str(int(time.time() * 1000))
     sign_str  = method.upper() + path + body + timestamp
+    # FIX: utf-8 вместо latin-1 — безопаснее для любых ключей
     signature = hmac.new(
-        API_SECRET.encode("latin-1"),
-        sign_str.encode("latin-1"),
+        API_SECRET.encode("utf-8"),
+        sign_str.encode("utf-8"),
         hashlib.sha256
     ).hexdigest()
     return {
@@ -90,17 +89,22 @@ def api_get(path, params=None):
     return r.json()
 
 def get_position(symbol):
-    # opened-position = активные позиции (pending-position = ожидающие)
-    r = api_get("/futures/opened-position", {"market": symbol, "market_type": "FUTURES"})
+    # CoinEx v2 API — правильный эндпоинт для открытых позиций
+    r = api_get("/futures/position", {"market": symbol, "market_type": "FUTURES"})
     print(f"  get_position raw: {json.dumps(r)[:400]}")
     if r.get("code") == 0:
         data = r.get("data", {})
+        # v2 возвращает dict с полями напрямую если позиция одна
+        if isinstance(data, dict) and data.get("market") == symbol:
+            return data
+        # или список
         if isinstance(data, list):
             for p in data:
                 if p.get("market") == symbol:
                     return p
-        elif isinstance(data, dict):
-            pos_list = data.get("position_list", data.get("positions", []))
+        # или вложенный список
+        pos_list = data.get("position_list", data.get("positions", []))
+        if isinstance(pos_list, list):
             for p in pos_list:
                 if p.get("market") == symbol:
                     return p
@@ -108,36 +112,36 @@ def get_position(symbol):
 
 def set_leverage(symbol, leverage):
     return api_post("/futures/adjust-position-leverage", {
-        "market":      symbol,
-        "market_type": "FUTURES",
-        "margin_mode": "cross",
-        "leverage":    leverage,  # int не строка
+        "market":        symbol,
+        "market_type":   "FUTURES",
+        "leverage":      str(leverage),
+        "position_side": "both"
     })
 
-def place_order(symbol, side, amount, reduce_only=False):
-    # leverage устанавливается один раз при старте — не здесь
-    payload = {
+def place_order(symbol, side, amount):
+    set_leverage(symbol, LEVERAGE)
+    return api_post("/futures/order", {
         "market":      symbol,
         "market_type": "FUTURES",
         "side":        side,
         "type":        "market",
         "amount":      str(amount),
-    }
-    if reduce_only:
-        payload["is_close"] = True  # CoinEx v2: уменьшает позицию, не переворачивает
-    return api_post("/futures/order", payload)
+    })
 
 def close_position(symbol):
     pos = get_position(symbol)
     if not pos:
+        print(f"  [WARN] close_position: позиция {symbol} не найдена — закрытие пропущено")
         return {"msg": "нет открытой позиции"}
-    side = "sell" if pos["side"] == "long" else "buy"
+    side = "sell" if pos.get("side") == "long" else "buy"
+    amount = str(pos.get("close_avbl", pos.get("open_interest", pos.get("amount", "0"))))
+    print(f"  close_position: side={side} amount={amount} pos={json.dumps(pos)[:200]}")
     return api_post("/futures/order", {
         "market":         symbol,
         "market_type":    "FUTURES",
         "side":           side,
         "type":           "market",
-        "amount":         str(pos.get("close_avbl", pos.get("open_interest", "0"))),
+        "amount":         amount,
         "close_position": True
     })
 
@@ -153,9 +157,8 @@ def webhook():
     action = data.get("action", "").lower()
     symbol = data.get("symbol", "SOLUSDT").upper()
     lots   = int(data.get("lots", 1))
-    # Всегда открываем один лот = LOT_SIZE, независимо от lots
-    # lots используется только для информации в логах
-    amount = LOT_SIZE  # фиксированный размер одного добора
+    # Каждый сигнал = один лот (добор пирамиды)
+    amount = LOT_SIZE
 
     print(f"\n[{time.strftime('%H:%M:%S')}] ACTION={action} | {symbol} | lots={lots} | amount={amount}")
 
@@ -169,48 +172,39 @@ def webhook():
         pos = get_position(symbol)
         if pos:
             side = "sell" if pos["side"] == "long" else "buy"
-            # reduce_only=True — только уменьшает позицию, не переворачивает
-            result = place_order(symbol, side, LOT_SIZE, reduce_only=True)
+            result = place_order(symbol, side, LOT_SIZE)
         else:
             result = {"msg": "нет позиции для выгрузки"}
     else:
         return jsonify({"error": f"unknown action: {action}"}), 400
 
     print(f"  ИТОГ: {result}")
-
-    # Логируем сигнал в журнал
     log_signal(data, result)
 
     return jsonify({"ok": True, "result": result})
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "server": "CoinEx Webhook v5"})
+    pos = get_position("SOLUSDT")
+    return jsonify({
+        "status":   "ok",
+        "server":   "CoinEx Webhook v5",
+        "position": pos
+    })
 
 @app.route("/position/<symbol>", methods=["GET"])
 def check_position(symbol):
     pos = get_position(symbol.upper())
     return jsonify({"position": pos})
 
-# === НОВЫЙ ЭНДПОИНТ — журнал сигналов ===
 @app.route("/signals", methods=["GET"])
 def get_signals():
-    """Отдаёт историю сигналов. Доступно без токена для дашборда."""
-    limit = int(request.args.get("limit", 50))
+    limit   = int(request.args.get("limit", 50))
     signals = list(signals_log)[-limit:]
-    signals.reverse()  # Новые сверху
-    return jsonify({
-        "count": len(signals),
-        "signals": signals
-    })
+    signals.reverse()
+    return jsonify({"count": len(signals), "signals": signals})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"Сервер запущен на порту {port}")
-    # Устанавливаем плечо один раз при старте
-    try:
-        lev_result = set_leverage("SOLUSDT", LEVERAGE)
-        print(f"Плечо установлено: {lev_result}")
-    except Exception as e:
-        print(f"Ошибка установки плеча: {e}")
     app.run(host="0.0.0.0", port=port)
