@@ -89,25 +89,31 @@ def api_get(path, params=None):
     return r.json()
 
 def get_position(symbol):
-    # CoinEx v2 API — правильный эндпоинт для открытых позиций
-    r = api_get("/futures/position", {"market": symbol, "market_type": "FUTURES"})
+    # CoinEx v2 API — правильный эндпоинт: /futures/pending-position
+    # Документация: https://docs.coinex.com/api/v2/futures/position/http/list-pending-position
+    # Пробуем без market_type — некоторые эндпоинты не принимают этот параметр
+    r = api_get("/futures/pending-position", {"market": symbol})
+    # Если 4009 — пробуем с market_type
+    if r.get("code") != 0:
+        r = api_get("/futures/pending-position", {"market": symbol, "market_type": "FUTURES"})
     print(f"  get_position raw: {json.dumps(r)[:400]}")
     if r.get("code") == 0:
         data = r.get("data", {})
-        # v2 возвращает dict с полями напрямую если позиция одна
-        if isinstance(data, dict) and data.get("market") == symbol:
-            return data
-        # или список
+        # v2 возвращает список позиций
         if isinstance(data, list):
             for p in data:
                 if p.get("market") == symbol:
                     return p
-        # или вложенный список
-        pos_list = data.get("position_list", data.get("positions", []))
-        if isinstance(pos_list, list):
-            for p in pos_list:
-                if p.get("market") == symbol:
-                    return p
+        # или dict с position_list
+        if isinstance(data, dict):
+            pos_list = data.get("position_list", data.get("positions", []))
+            if isinstance(pos_list, list):
+                for p in pos_list:
+                    if p.get("market") == symbol:
+                        return p
+            # или прямо dict если одна позиция
+            if data.get("market") == symbol:
+                return data
     return None
 
 def set_leverage(symbol, leverage):
