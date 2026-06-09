@@ -91,11 +91,8 @@ def api_get(path, params=None):
 def get_position(symbol):
     # CoinEx v2 API — правильный эндпоинт: /futures/pending-position
     # Документация: https://docs.coinex.com/api/v2/futures/position/http/list-pending-position
-    # Пробуем без market_type — некоторые эндпоинты не принимают этот параметр
-    r = api_get("/futures/pending-position", {"market": symbol})
-    # Если 4009 — пробуем с market_type
-    if r.get("code") != 0:
-        r = api_get("/futures/pending-position", {"market": symbol, "market_type": "FUTURES"})
+    # CoinEx v2 — правильный эндпоинт с market_type
+    r = api_get("/futures/pending-position", {"market": symbol, "market_type": "FUTURES"})
     print(f"  get_position raw: {json.dumps(r)[:400]}")
     if r.get("code") == 0:
         data = r.get("data", {})
