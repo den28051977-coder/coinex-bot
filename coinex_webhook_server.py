@@ -145,30 +145,38 @@ def calc_lot_size(symbol):
 
 
 def get_position(symbol):
-    r = api_get("/futures/position", {"market": symbol, "market_type": "FUTURES"})
-    print(f"  get_position raw: {json.dumps(r)[:400]}")
-    if r.get("code") == 0:
+    # CoinEx v2 — пробуем актуальные эндпоинты по очереди
+    for ep in ["/futures/pending-position", "/futures/position"]:
+        r = api_get(ep, {"market": symbol, "market_type": "FUTURES"})
+        print(f"  get_position [{ep}]: {json.dumps(r)[:300]}")
+        if r.get("code") == 4009:
+            continue  # unknown method — следующий
+        if r.get("code") != 0:
+            return None
         data = r.get("data", {})
-        if isinstance(data, dict) and data.get("market") == symbol:
-            return data
         if isinstance(data, list):
             for p in data:
                 if p.get("market") == symbol:
                     return p
-        pos_list = data.get("position_list", data.get("positions", []))
-        if isinstance(pos_list, list):
-            for p in pos_list:
-                if p.get("market") == symbol:
-                    return p
+            return None  # пустой список = нет позиции
+        if isinstance(data, dict):
+            if data.get("market") == symbol:
+                return data
+            for key in ["position_list", "positions"]:
+                pos_list = data.get(key, [])
+                if isinstance(pos_list, list):
+                    for p in pos_list:
+                        if p.get("market") == symbol:
+                            return p
+        return None
     return None
 
 
 def set_leverage(symbol, leverage):
     return api_post("/futures/adjust-position-leverage", {
-        "market":        symbol,
-        "market_type":   "FUTURES",
-        "leverage":      str(leverage),
-        "position_side": "both"
+        "market":      symbol,
+        "market_type": "FUTURES",
+        "leverage":    str(leverage),
     })
 
 
