@@ -49,6 +49,7 @@ position_state = {
     "dir": 0,        # 1=long, -1=short, 0=flat
     "avg": 0.0,
     "lots": 0,
+    "avwap_tp": 0.0, # тейк на AVWAP mid (0 = не установлен)
 }
 
 
@@ -236,6 +237,19 @@ def guardian_check(symbol):
         print(f"  [GUARDIAN] Убыток {loss_pct:.2f}% >= {MAX_LOSS_PCT}% — закрываю позицию")
         result = close_position(symbol)
         log_signal({"action": "guardian_close", "symbol": symbol, "avg": str(avg)}, result)
+        return
+
+    # AVWAP TP — серверный тейк если цена достигла AVWAP mid
+    avwap_tp = position_state.get("avwap_tp", 0)
+    if avwap_tp > 0:
+        if position_state["dir"] == 1 and price >= avwap_tp and avg < avwap_tp:
+            print(f"  [AVWAP TP] Цена {price} >= AVWAP {avwap_tp} — закрываю лонг")
+            result = close_position(symbol)
+            log_signal({"action": "avwap_tp", "symbol": symbol, "avg": str(avg)}, result)
+        elif position_state["dir"] == -1 and price <= avwap_tp and avg > avwap_tp:
+            print(f"  [AVWAP TP] Цена {price} <= AVWAP {avwap_tp} — закрываю шорт")
+            result = close_position(symbol)
+            log_signal({"action": "avwap_tp", "symbol": symbol, "avg": str(avg)}, result)
 
 
 @app.route("/webhook", methods=["POST"])
@@ -276,6 +290,8 @@ def webhook():
                 position_state["avg"]    = avg_val if avg_val > 0 else float(fp)
                 position_state["lots"]   = lots
                 position_state["symbol"] = symbol
+                avwap_val = float(data.get("avwap_mid", 0) or 0)
+                position_state["avwap_tp"] = avwap_val
 
     elif action == "sell":
         # Если открыт лонг — сначала закрываем
@@ -292,6 +308,8 @@ def webhook():
                 position_state["avg"]    = avg_val if avg_val > 0 else float(fp)
                 position_state["lots"]   = lots
                 position_state["symbol"] = symbol
+                avwap_val = float(data.get("avwap_mid", 0) or 0)
+                position_state["avwap_tp"] = avwap_val
 
     elif action == "close_all":
         result = close_position(symbol)
