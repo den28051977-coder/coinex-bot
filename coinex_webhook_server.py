@@ -59,6 +59,7 @@ def log_signal(data, result, filled_price=None):
         "symbol":       data.get("symbol", ""),
         "lots":         data.get("lots", 1),
         "power":        data.get("power", ""),
+        "signal":       data.get("signal", ""),
         "zone":         data.get("zone", ""),
         "trend":        data.get("trend", ""),
         "avg":          data.get("avg", ""),
