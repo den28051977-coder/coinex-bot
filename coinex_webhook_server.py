@@ -262,8 +262,12 @@ def webhook():
     guardian_check(symbol)
 
     if action == "buy":
+        # Если открыт шорт — сначала закрываем
+        pos = get_position(symbol)
+        if pos and pos.get("side") == "short":
+            print(f"  [INFO] Открыт шорт — закрываем перед лонгом")
+            close_position(symbol)
         result = place_order(symbol, "buy", amount)
-        # Обновляем состояние
         if isinstance(result, dict) and result.get("code") == 0:
             fp = result.get("data", {}).get("last_filled_price")
             if fp:
@@ -274,6 +278,11 @@ def webhook():
                 position_state["symbol"] = symbol
 
     elif action == "sell":
+        # Если открыт лонг — сначала закрываем
+        pos = get_position(symbol)
+        if pos and pos.get("side") == "long":
+            print(f"  [INFO] Открыт лонг — закрываем перед шортом")
+            close_position(symbol)
         result = place_order(symbol, "sell", amount)
         if isinstance(result, dict) and result.get("code") == 0:
             fp = result.get("data", {}).get("last_filled_price")
