@@ -41,6 +41,11 @@ MAX_LOSS_PCT     = float(os.environ.get("MAX_LOSS_PCT", "3.0"))
 GUARDIAN_ENABLED = os.environ.get("GUARDIAN", "true").lower() == "true"
 GUARDIAN_INTERVAL = int(os.environ.get("GUARDIAN_INTERVAL", "30"))  # секунды
 
+# ─── Telegram ───
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_ENABLED   = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+
 BASE_URL = "https://api.coinex.com"
 signals_log = deque(maxlen=200)
 
@@ -69,7 +74,31 @@ SIGNAL_TYPES = {
 }
 
 
-def log_signal(data, result, filled_price=None, extra=None):
+def send_telegram(text):
+    """Отправляет сообщение в Telegram. Не бросает исключения наружу —
+    если Telegram не настроен или недоступен, просто логирует ошибку
+    в консоль и продолжает работу бота (торговля не должна зависеть
+    от доступности Telegram)."""
+    if not TELEGRAM_ENABLED:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        resp = requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML"
+        }, timeout=5)
+        if resp.status_code != 200:
+            print(f"  [TELEGRAM] Ошибка отправки: {resp.status_code} {resp.text}")
+    except Exception as e:
+        print(f"  [TELEGRAM] Исключение при отправке: {e}")
+
+
+def f_signal_label(signal):
+    return SIGNAL_TYPES.get(signal, {"label": signal}).get("label", signal)
+
+
+
     sig = data.get("signal", "")
     sig_info = SIGNAL_TYPES.get(sig, {"label": sig})
     entry = {
@@ -299,21 +328,13 @@ def webhook():
     if request.args.get("token", "") != WEBHOOK_TOKEN:
         return jsonify({"error": "unauthorized"}), 401
 
-    # force=True — парсим JSON даже если Content-Type не application/json (TradingView)
-    data = request.get_json(silent=True, force=True)
-    if not data:
-        # Fallback — пробуем парсить тело запроса напрямую
-        try:
-            data = json.loads(request.data.decode("utf-8"))
-        except Exception:
-            return jsonify({"error": "no json"}), 400
+    data = request.get_json(silent=True)
     if not data:
         return jsonify({"error": "no json"}), 400
 
     action = data.get("action", "").lower()
     symbol = data.get("symbol", "SOLUSDT").upper()
-    # Поддержка lots_closed и m1_lots_closed (от 1м пирамиды)
-    lots   = int(data.get("lots", data.get("lots_closed", data.get("m1_lots_closed", 1))))
+    lots   = int(data.get("lots", 1))
     power  = int(data.get("power", 1))
     signal = data.get("signal", "checklist")
 
@@ -335,11 +356,11 @@ def webhook():
         result = place_order(symbol, "buy", amount)
         if isinstance(result, dict) and result.get("code") == 0:
             fp = result.get("data", {}).get("last_filled_price")
-            try: avg_val = float(str(data.get("avg", 0) or 0))
-            except: avg_val = 0.0
+            avg_val = float(data.get("avg", 0) or 0)
+            entry_price = avg_val if avg_val > 0 else float(fp or 0)
             position_state.update({
                 "dir":      1,
-                "avg":      avg_val if avg_val > 0 else float(fp or 0),
+                "avg":      entry_price,
                 "lots":     lots,
                 "symbol":   symbol,
                 "signal":   signal,
@@ -347,6 +368,14 @@ def webhook():
                 "zone":     data.get("zone", ""),
                 "avwap_tp": float(data.get("avwap_mid", 0) or 0),
             })
+            send_telegram(
+                f"🟢 <b>ЛОНГ открыт</b>\n"
+                f"Символ: {symbol}\n"
+                f"Лоты: {lots} | Сила: {power}\n"
+                f"Сигнал: {f_signal_label(signal)}\n"
+                f"Цена входа: {entry_price:.4f}\n"
+                f"Зона: {data.get('zone','—')}"
+            )
 
     elif action == "sell":
         pos = get_position(symbol)
@@ -356,11 +385,11 @@ def webhook():
         result = place_order(symbol, "sell", amount)
         if isinstance(result, dict) and result.get("code") == 0:
             fp = result.get("data", {}).get("last_filled_price")
-            try: avg_val = float(str(data.get("avg", 0) or 0))
-            except: avg_val = 0.0
+            avg_val = float(data.get("avg", 0) or 0)
+            entry_price = avg_val if avg_val > 0 else float(fp or 0)
             position_state.update({
                 "dir":      -1,
-                "avg":      avg_val if avg_val > 0 else float(fp or 0),
+                "avg":      entry_price,
                 "lots":     lots,
                 "symbol":   symbol,
                 "signal":   signal,
@@ -368,9 +397,34 @@ def webhook():
                 "zone":     data.get("zone", ""),
                 "avwap_tp": float(data.get("avwap_mid", 0) or 0),
             })
+            send_telegram(
+                f"🔴 <b>ШОРТ открыт</b>\n"
+                f"Символ: {symbol}\n"
+                f"Лоты: {lots} | Сила: {power}\n"
+                f"Сигнал: {f_signal_label(signal)}\n"
+                f"Цена входа: {entry_price:.4f}\n"
+                f"Зона: {data.get('zone','—')}"
+            )
 
     elif action == "close_all":
+        old_dir  = position_state.get("dir", 0)
+        old_avg  = position_state.get("avg", 0.0)
+        old_lots = position_state.get("lots", 0)
+        cur_price = get_current_price(symbol)
         result = close_position(symbol)
+        if old_dir != 0 and old_avg > 0 and cur_price:
+            pnl_pct = (cur_price - old_avg) / old_avg * 100 * old_dir
+            emoji = "✅" if pnl_pct >= 0 else "❌"
+            send_telegram(
+                f"{emoji} <b>Позиция закрыта</b>\n"
+                f"Символ: {symbol}\n"
+                f"Направление: {'ЛОНГ' if old_dir == 1 else 'ШОРТ'}\n"
+                f"Лоты: {old_lots}\n"
+                f"Причина: {data.get('reason', data.get('signal',''))}\n"
+                f"PnL: {pnl_pct:+.2f}%"
+            )
+        else:
+            send_telegram(f"ℹ️ Закрытие позиции {symbol} (причина: {data.get('reason', data.get('signal',''))})")
 
     elif action == "reverse":
         # Атомарный разворот — закрыть старую и открыть новую
@@ -382,11 +436,11 @@ def webhook():
             result = place_order(symbol, new_side, amount)
             if isinstance(result, dict) and result.get("code") == 0:
                 fp = result.get("data", {}).get("last_filled_price")
-                try: avg_val = float(str(data.get("avg", 0) or 0))
-                except: avg_val = 0.0
+                avg_val = float(data.get("avg", 0) or 0)
+                entry_price = avg_val if avg_val > 0 else float(fp or 0)
                 position_state.update({
                     "dir":      1 if new_side == "buy" else -1,
-                    "avg":      avg_val if avg_val > 0 else float(fp or 0),
+                    "avg":      entry_price,
                     "lots":     lots,
                     "symbol":   symbol,
                     "signal":   signal,
@@ -394,6 +448,14 @@ def webhook():
                     "zone":     data.get("zone", ""),
                     "avwap_tp": float(data.get("avwap_mid", 0) or 0),
                 })
+                send_telegram(
+                    f"🔄 <b>РАЗВОРОТ</b>\n"
+                    f"Символ: {symbol}\n"
+                    f"Новое направление: {'ЛОНГ' if new_side == 'buy' else 'ШОРТ'}\n"
+                    f"Лоты: {lots} | Сила: {power}\n"
+                    f"Сигнал: {f_signal_label(signal)}\n"
+                    f"Цена входа: {entry_price:.4f}"
+                )
         else:
             result = {"msg": "reverse: нет new_side"}
 
@@ -411,6 +473,20 @@ def webhook():
         # Информационные события — только логируем
         print(f"  [INFO] Событие {action} — только лог")
         result = {"msg": f"logged: {action}"}
+
+    elif action == "info":
+        # Информационный сигнал без торгового действия (например,
+        # обеденный разворот NY Lunch Judas) — только уведомление в Telegram
+        note = data.get("note", "")
+        level = data.get("level", "")
+        price = data.get("price", "")
+        print(f"  [INFO] {signal}: {note}")
+        send_telegram(
+            f"📢 <b>{f_signal_label(signal)}</b>\n"
+            f"{note}\n"
+            f"Уровень: {level} | Цена: {price}"
+        )
+        result = {"msg": f"info logged: {signal}"}
 
     else:
         return jsonify({"error": f"unknown action: {action}"}), 400
@@ -734,21 +810,13 @@ def webhook():
     if request.args.get("token", "") != WEBHOOK_TOKEN:
         return jsonify({"error": "unauthorized"}), 401
 
-    # force=True — парсим JSON даже если Content-Type не application/json (TradingView)
-    data = request.get_json(silent=True, force=True)
-    if not data:
-        # Fallback — пробуем парсить тело запроса напрямую
-        try:
-            data = json.loads(request.data.decode("utf-8"))
-        except Exception:
-            return jsonify({"error": "no json"}), 400
+    data = request.get_json(silent=True)
     if not data:
         return jsonify({"error": "no json"}), 400
 
     action = data.get("action", "").lower()
     symbol = data.get("symbol", "SOLUSDT").upper()
-    # Поддержка lots_closed и m1_lots_closed (от 1м пирамиды)
-    lots   = int(data.get("lots", data.get("lots_closed", data.get("m1_lots_closed", 1))))
+    lots   = int(data.get("lots", 1))
     power  = int(data.get("power", 1))   # сила сигнала из Pine 1/2/3
 
     # Динамический размер одного лота
@@ -770,8 +838,7 @@ def webhook():
         if isinstance(result, dict) and result.get("code") == 0:
             fp = result.get("data", {}).get("last_filled_price")
             if fp:
-                try: avg_val = float(str(data.get("avg", 0) or 0))
-                except: avg_val = 0.0
+                avg_val = float(data.get("avg", 0) or 0)
                 position_state["dir"]    = 1
                 position_state["avg"]    = avg_val if avg_val > 0 else float(fp)
                 position_state["lots"]   = lots
@@ -789,8 +856,7 @@ def webhook():
         if isinstance(result, dict) and result.get("code") == 0:
             fp = result.get("data", {}).get("last_filled_price")
             if fp:
-                try: avg_val = float(str(data.get("avg", 0) or 0))
-                except: avg_val = 0.0
+                avg_val = float(data.get("avg", 0) or 0)
                 position_state["dir"]    = -1
                 position_state["avg"]    = avg_val if avg_val > 0 else float(fp)
                 position_state["lots"]   = lots
