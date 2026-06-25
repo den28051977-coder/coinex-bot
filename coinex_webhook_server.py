@@ -83,7 +83,7 @@ SIGNAL_TYPES = {
 }
 
 # Колонки CSV-лога (фиксированный набор, лишние ключи игнорируются)
-CSV_FIELDS = ["time", "action", "signal", "signal_label", "zone", "trend",
+CSV_FIELDS = ["time", "action", "signal", "signal_label", "zone", "zone_h1", "trend",
               "power", "lots", "avg", "filled_price", "pnl", "loss_pct",
               "source", "result"]
 
@@ -138,6 +138,7 @@ def log_signal(data, result, filled_price=None, extra=None):
         "signal":       sig,
         "signal_label": sig_info.get("label", sig),
         "zone":         data.get("zone", ""),
+        "zone_h1":      data.get("zone_h1", ""),
         "trend":        data.get("trend", ""),
         "avg":          data.get("avg", ""),
         "filled_price": filled_price,
@@ -421,7 +422,7 @@ def webhook():
     lot_size = calc_lot_size(symbol, signal)
     amount   = round(lot_size * lots, 3)
 
-    print(f"\n[{time.strftime('%H:%M:%S')}] ACTION={action} | {symbol} | lots={lots} | power={power} | signal={signal} | amount={amount} | zone={data.get('zone','')} | trend={data.get('trend','')}")
+    print(f"\n[{time.strftime('%H:%M:%S')}] ACTION={action} | {symbol} | lots={lots} | power={power} | signal={signal} | amount={amount} | zone={data.get('zone','')} | zone_h1={data.get('zone_h1','')} | trend={data.get('trend','')}")
 
     # Guardian перед действием
     guardian_check(symbol, source="pre-webhook")
