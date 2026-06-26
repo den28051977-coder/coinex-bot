@@ -83,7 +83,7 @@ SIGNAL_TYPES = {
 }
 
 # Колонки CSV-лога (фиксированный набор, лишние ключи игнорируются)
-CSV_FIELDS = ["time", "action", "signal", "signal_label", "zone", "zone_h1", "trend",
+CSV_FIELDS = ["time", "action", "signal", "signal_label", "zone", "zone_h1", "zone_h4", "trend",
               "power", "lots", "avg", "filled_price", "pnl", "loss_pct",
               "source", "result"]
 
@@ -139,6 +139,7 @@ def log_signal(data, result, filled_price=None, extra=None):
         "signal_label": sig_info.get("label", sig),
         "zone":         data.get("zone", ""),
         "zone_h1":      data.get("zone_h1", ""),
+        "zone_h4":      data.get("zone_h4", ""),
         "trend":        data.get("trend", ""),
         "avg":          data.get("avg", ""),
         "filled_price": filled_price,
