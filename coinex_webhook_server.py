@@ -84,6 +84,7 @@ SIGNAL_TYPES = {
 
 # Колонки CSV-лога (фиксированный набор, лишние ключи игнорируются)
 CSV_FIELDS = ["time", "action", "signal", "signal_label", "zone", "zone_h1", "zone_h4", "trend",
+              "delta_day", "delta_range",
               "power", "lots", "avg", "filled_price", "pnl", "loss_pct",
               "source", "result"]
 
@@ -141,6 +142,8 @@ def log_signal(data, result, filled_price=None, extra=None):
         "zone_h1":      data.get("zone_h1", ""),
         "zone_h4":      data.get("zone_h4", ""),
         "trend":        data.get("trend", ""),
+        "delta_day":    data.get("delta_day", ""),
+        "delta_range":  data.get("delta_range", ""),
         "avg":          data.get("avg", ""),
         "filled_price": filled_price,
         "result":       "ok" if isinstance(result, dict) and result.get("code") == 0 else str(result.get("msg", result) if isinstance(result, dict) else result),
@@ -423,7 +426,7 @@ def webhook():
     lot_size = calc_lot_size(symbol, signal)
     amount   = round(lot_size * lots, 3)
 
-    print(f"\n[{time.strftime('%H:%M:%S')}] ACTION={action} | {symbol} | lots={lots} | power={power} | signal={signal} | amount={amount} | zone={data.get('zone','')} | zone_h1={data.get('zone_h1','')} | trend={data.get('trend','')}")
+    print(f"\n[{time.strftime('%H:%M:%S')}] ACTION={action} | {symbol} | lots={lots} | power={power} | signal={signal} | amount={amount} | zone={data.get('zone','')} | zone_h1={data.get('zone_h1','')} | trend={data.get('trend','')} | dDay={data.get('delta_day','')} | dRange={data.get('delta_range','')}")
 
     # Guardian перед действием
     guardian_check(symbol, source="pre-webhook")
