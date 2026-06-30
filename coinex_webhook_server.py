@@ -52,6 +52,7 @@ TELEGRAM_ENABLED   = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
 BASE_URL = "https://api.coinex.com"
 signals_log = deque(maxlen=200)
+market_state = None  # последний heartbeat от Pine (живая методичка): цена/зоны/уровни/дельты
 
 # Защита от гонок: guardian-поток и webhook могут писать лог одновременно
 _log_lock    = threading.Lock()
@@ -491,6 +492,31 @@ def webhook():
 
     action = data.get("action", "").lower()
     symbol = data.get("symbol", "SOLUSDT").upper()
+
+    # ── HEARTBEAT: факты рынка раз в бар (живая методичка) ──
+    # Не торгует, не пишет в signals_log — только обновляет market_state.
+    if action == "heartbeat":
+        global market_state
+        market_state = {
+            "updated":      int(time.time()),
+            "price":        data.get("price", ""),
+            "zone":         data.get("zone", ""),
+            "zone_h1":      data.get("zone_h1", ""),
+            "zone_h4":      data.get("zone_h4", ""),
+            "week_hi":      data.get("week_hi", ""),
+            "week_lo":      data.get("week_lo", ""),
+            "pwh":          data.get("pwh", ""),
+            "pwl":          data.get("pwl", ""),
+            "pdh":          data.get("pdh", ""),
+            "pdl":          data.get("pdl", ""),
+            "avwap":        data.get("avwap", ""),
+            "delta_day":    data.get("delta_day", ""),
+            "delta_range":  data.get("delta_range", ""),
+            "last_extreme": data.get("last_extreme", ""),
+            "trend":        data.get("trend", ""),
+        }
+        return jsonify({"ok": True, "heartbeat": True})
+
     lots   = int(data.get("lots", 1))
     power  = int(data.get("power", 1))
     signal = data.get("signal", "checklist")
@@ -688,10 +714,18 @@ def check_position(symbol):
     return jsonify({"position": pos, "state": position_state})
 
 
+@app.route("/state", methods=["GET"])
+def state():
+    # Живое состояние рынка из heartbeat (Pine раз в бар). None если heartbeat ещё не пришёл.
+    return jsonify(market_state or {"waiting": "no heartbeat yet"})
+
+
 @app.route("/levels", methods=["GET"])
 def levels():
-    # Уровни приходят из Pine (Binance) в payload входов — берём последние известные из лога.
-    # Binance напрямую с Railway (US-IP) заблокирован, поэтому источник = Pine через webhook.
+    # Уровни из heartbeat (свежие, не зависят от входов). Фолбэк — последний вход из лога.
+    if market_state:
+        return jsonify({k: market_state.get(k) for k in
+                        ("week_hi", "week_lo", "pwh", "pwl", "pdh", "pdl", "avwap", "updated")})
     out = {"source": "pine_payload"}
     try:
         for s in reversed(signals_log):
