@@ -513,6 +513,7 @@ def webhook():
             "delta_day":    data.get("delta_day", ""),
             "delta_range":  data.get("delta_range", ""),
             "last_extreme": data.get("last_extreme", ""),
+            "came_from":    data.get("came_from", ""),
             "trend":        data.get("trend", ""),
         }
         return jsonify({"ok": True, "heartbeat": True})
