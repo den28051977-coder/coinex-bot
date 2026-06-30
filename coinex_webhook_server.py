@@ -84,7 +84,7 @@ SIGNAL_TYPES = {
 
 # Колонки CSV-лога (фиксированный набор, лишние ключи игнорируются)
 CSV_FIELDS = ["time", "action", "signal", "signal_label", "zone", "zone_h1", "zone_h4", "trend",
-              "delta_day", "delta_range", "last_extreme",
+              "delta_day", "delta_range", "last_extreme", "week_hi", "week_lo", "pwh", "pwl",
               "power", "lots", "avg", "filled_price", "pnl", "loss_pct",
               "source", "result"]
 
@@ -145,6 +145,10 @@ def log_signal(data, result, filled_price=None, extra=None):
         "delta_day":    data.get("delta_day", ""),
         "delta_range":  data.get("delta_range", ""),
         "last_extreme": data.get("last_extreme", ""),
+        "week_hi":      data.get("week_hi", ""),
+        "week_lo":      data.get("week_lo", ""),
+        "pwh":          data.get("pwh", ""),
+        "pwl":          data.get("pwl", ""),
         "avg":          data.get("avg", ""),
         "filled_price": filled_price,
         "result":       "ok" if isinstance(result, dict) and result.get("code") == 0 else str(result.get("msg", result) if isinstance(result, dict) else result),
@@ -686,7 +690,19 @@ def check_position(symbol):
 
 @app.route("/levels", methods=["GET"])
 def levels():
-    return jsonify(calc_levels("SOLUSDT"))
+    # Уровни приходят из Pine (Binance) в payload входов — берём последние известные из лога.
+    # Binance напрямую с Railway (US-IP) заблокирован, поэтому источник = Pine через webhook.
+    out = {"source": "pine_payload"}
+    try:
+        for s in reversed(signals_log):
+            for k in ("week_hi", "week_lo", "pwh", "pwl"):
+                if k not in out and s.get(k) not in (None, ""):
+                    out[k] = s.get(k)
+            if all(k in out for k in ("week_hi", "week_lo", "pwh", "pwl")):
+                break
+    except Exception as e:
+        out["error"] = str(e)
+    return jsonify(out)
 
 
 @app.route("/signals", methods=["GET"])
