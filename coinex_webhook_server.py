@@ -216,6 +216,79 @@ def get_current_price(symbol):
     return 0.0
 
 
+# ─────────────────────────────────────────────────────────────
+#  МОДУЛЬ УРОВНЕЙ (Binance — там ликвидность SOL)
+#  День: PDH/PDL/DO · Неделя вс→вс: Week Hi/Lo, PWH/PWL, WO
+#  Кэш 15 мин (уровни медленные, API не дёргаем часто)
+# ─────────────────────────────────────────────────────────────
+import time as _time
+from datetime import datetime, timezone, timedelta
+
+_levels_cache = {"ts": 0, "data": None}
+_LEVELS_TTL = 15 * 60  # 15 минут
+
+def get_binance_klines(symbol="SOLUSDT", interval="1d", limit=60):
+    """Свечи с Binance (публичный API, без подписи). [[openTime,o,h,l,c,v,closeTime,...]]"""
+    try:
+        url = "https://api.binance.com/api/v3/klines"
+        r = requests.get(url, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+        print(f"  [LEVELS] binance klines {interval} → HTTP {r.status_code}")
+    except Exception as e:
+        print(f"  [LEVELS] klines error: {e}")
+    return []
+
+def _week_start_sunday(ts):
+    """Timestamp начала крипто-недели (воскресенье 00:00 UTC) для данного ts."""
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    days_since_sunday = (dt.weekday() + 1) % 7  # Вс=0, Пн=1..Сб=6
+    ws = dt.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days_since_sunday)
+    return int(ws.timestamp())
+
+def calc_levels(symbol="SOLUSDT"):
+    """Считает уровни день/неделя. Кэш 15 мин."""
+    now = _time.time()
+    if _levels_cache["data"] is not None and (now - _levels_cache["ts"]) < _LEVELS_TTL:
+        return _levels_cache["data"]
+
+    out = {"updated": int(now)}
+    # дневные свечи (последние 70 дней — хватит на дни/недели вс→вс)
+    days = get_binance_klines(symbol, "1d", 70)
+    if days and len(days) >= 2:
+        # [openTime(ms),o,h,l,c,v,...]; последняя свеча = сегодня (формируется)
+        def H(k): return float(k[2])
+        def L(k): return float(k[3])
+        def O(k): return float(k[1])
+        # ДЕНЬ
+        out["DO"]  = O(days[-1])           # открытие сегодня
+        out["PDH"] = H(days[-2])           # вчерашний high
+        out["PDL"] = L(days[-2])           # вчерашний low
+        # НЕДЕЛЯ вс→вс — группируем дневные свечи по крипто-неделям
+        cur_ws = _week_start_sunday(int(days[-1][0] / 1000))
+        prev_ws = cur_ws - 7 * 86400
+        cur_days, prev_days = [], []
+        for k in days:
+            kt = int(k[0] / 1000)
+            kws = _week_start_sunday(kt)
+            if kws == cur_ws:
+                cur_days.append(k)
+            elif kws == prev_ws:
+                prev_days.append(k)
+        if cur_days:
+            out["week_hi"] = max(H(k) for k in cur_days)
+            out["week_lo"] = min(L(k) for k in cur_days)
+            out["WO"]      = O(cur_days[0])    # открытие недели (воскресенье)
+        if prev_days:
+            out["PWH"] = max(H(k) for k in prev_days)
+            out["PWL"] = min(L(k) for k in prev_days)
+
+    _levels_cache["data"] = out
+    _levels_cache["ts"] = now
+    print(f"  [LEVELS] обновлены: {out}")
+    return out
+
+
 def calc_lot_size(symbol, signal=""):
     if LOT_SIZE_FIXED > 0:
         return LOT_SIZE_FIXED
@@ -609,6 +682,11 @@ def health():
 def check_position(symbol):
     pos = get_position(symbol.upper())
     return jsonify({"position": pos, "state": position_state})
+
+
+@app.route("/levels", methods=["GET"])
+def levels():
+    return jsonify(calc_levels("SOLUSDT"))
 
 
 @app.route("/signals", methods=["GET"])
