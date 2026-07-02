@@ -511,6 +511,7 @@ def webhook():
             "pdl":          data.get("pdl", ""),
             "avwap":        data.get("avwap", ""),
             "delta_day":    data.get("delta_day", ""),
+            "delta_sess":   data.get("delta_sess", ""),
             "delta_range":  data.get("delta_range", ""),
             "last_extreme": data.get("last_extreme", ""),
             "trend":        data.get("trend", ""),
