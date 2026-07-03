@@ -86,6 +86,7 @@ SIGNAL_TYPES = {
 # Колонки CSV-лога (фиксированный набор, лишние ключи игнорируются)
 CSV_FIELDS = ["time", "action", "signal", "signal_label", "zone", "zone_h1", "zone_h4", "trend",
               "delta_day", "delta_range", "last_extreme", "week_hi", "week_lo", "pwh", "pwl",
+              "avwap", "pdh", "pdl",
               "power", "lots", "avg", "filled_price", "pnl", "loss_pct",
               "source", "result"]
 
@@ -150,6 +151,9 @@ def log_signal(data, result, filled_price=None, extra=None):
         "week_lo":      data.get("week_lo", ""),
         "pwh":          data.get("pwh", ""),
         "pwl":          data.get("pwl", ""),
+        "avwap":        data.get("avwap", ""),
+        "pdh":          data.get("pdh", ""),
+        "pdl":          data.get("pdl", ""),
         "avg":          data.get("avg", ""),
         "filled_price": filled_price,
         "result":       "ok" if isinstance(result, dict) and result.get("code") == 0 else str(result.get("msg", result) if isinstance(result, dict) else result),
