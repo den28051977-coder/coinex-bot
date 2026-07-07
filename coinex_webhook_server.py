@@ -521,6 +521,9 @@ def webhook():
             "trend":        data.get("trend", ""),
             "came_from":    data.get("came_from", ""),
             "btc_conflict": data.get("btc_conflict", 0),
+            "wk_profile":   data.get("wk_profile", ""),
+            "dp_profile":   data.get("dp_profile", ""),
+            "dp_plan":      data.get("dp_plan", ""),
         }
         return jsonify({"ok": True, "heartbeat": True})
 
