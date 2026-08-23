@@ -347,6 +347,26 @@ def set_leverage(symbol, leverage):
     })
 
 
+def set_position_tp(symbol, tp_price):
+    """Установить тейк-профит на текущую позицию по символу."""
+    return api_post("/futures/set-position-take-profit", {
+        "market":            symbol,
+        "market_type":       "FUTURES",
+        "take_profit_type":  "latest_price",
+        "take_profit_price": str(tp_price),
+    })
+
+
+def set_position_sl(symbol, sl_price):
+    """Установить стоп-лосс на текущую позицию по символу."""
+    return api_post("/futures/set-position-stop-loss", {
+        "market":          symbol,
+        "market_type":     "FUTURES",
+        "stop_loss_type":  "latest_price",
+        "stop_loss_price": str(sl_price),
+    })
+
+
 def place_order(symbol, side, amount):
     set_leverage(symbol, LEVERAGE)
     return api_post("/futures/order", {
@@ -845,6 +865,94 @@ def open_straddle():
         "long_usdt": results.get("long_usdt"),
         "short_usdc": results.get("short_usdc"),
         "warning": warning
+    })
+
+
+@app.route("/straddle-tpsl", methods=["POST", "OPTIONS"])
+def straddle_tpsl():
+    """
+    Выставить стоп/тейк на ОБЕ ноги стрэддла по процентам из сетапа.
+    Тело: {"base":"XRP", "stop_pct":0.6, "take_pct":0.77,
+           "entry_usdt":1.493, "entry_usdc":1.493}   (entry опционально — иначе с позиции)
+    Стоп/тейк зеркальны: лонг USDT и шорт USDC считаются в разные стороны.
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if request.args.get("token", "") != WEBHOOK_TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(silent=True) or {}
+    base = str(data.get("base", "SOL")).upper()
+    sym_usdt = base + "USDT"
+    sym_usdc = base + "USDC"
+    try:
+        stop_pct = float(data.get("stop_pct", 0))
+        take_pct = float(data.get("take_pct", 0))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "неверные проценты"}), 400
+    if stop_pct <= 0 or take_pct <= 0:
+        return jsonify({"ok": False, "error": "stop_pct/take_pct должны быть > 0"}), 400
+
+    # цены входа: из тела или с позиции на бирже
+    def entry_of(symbol, explicit):
+        v = data.get(explicit)
+        if v:
+            try:
+                fv = float(v)
+                if fv > 0:
+                    return fv
+            except (TypeError, ValueError):
+                pass
+        pos = get_position(symbol)
+        if pos:
+            for k in ("avg_entry_price", "entry_price", "open_price", "avg_price"):
+                if pos.get(k):
+                    try:
+                        return float(pos[k])
+                    except (TypeError, ValueError):
+                        pass
+        return 0.0
+
+    e_usdt = entry_of(sym_usdt, "entry_usdt")
+    e_usdc = entry_of(sym_usdc, "entry_usdc")
+
+    sf = stop_pct / 100.0
+    tf = take_pct / 100.0
+    out = {}
+
+    # ЛОНГ USDT: тейк выше входа, стоп ниже
+    if e_usdt > 0:
+        out["long_usdt"] = {
+            "tp": set_position_tp(sym_usdt, round(e_usdt * (1 + tf), 6)),
+            "sl": set_position_sl(sym_usdt, round(e_usdt * (1 - sf), 6)),
+            "entry": e_usdt,
+        }
+    else:
+        out["long_usdt"] = {"error": "нет позиции/цены входа USDT"}
+
+    # ШОРТ USDC: тейк НИЖЕ входа, стоп ВЫШЕ (зеркально)
+    if e_usdc > 0:
+        out["short_usdc"] = {
+            "tp": set_position_tp(sym_usdc, round(e_usdc * (1 - tf), 6)),
+            "sl": set_position_sl(sym_usdc, round(e_usdc * (1 + sf), 6)),
+            "entry": e_usdc,
+        }
+    else:
+        out["short_usdc"] = {"error": "нет позиции/цены входа USDC"}
+
+    def ok(leg):
+        return isinstance(leg, dict) and isinstance(leg.get("tp"), dict) and leg["tp"].get("code") == 0 \
+               and isinstance(leg.get("sl"), dict) and leg["sl"].get("code") == 0
+    both = ok(out.get("long_usdt")) and ok(out.get("short_usdc"))
+
+    log_signal({"action": "straddle_tpsl", "symbol": base,
+                "signal": "tpsl_" + ("ok" if both else "partial")}, out)
+
+    return jsonify({
+        "ok": both,
+        "base": base, "stop_pct": stop_pct, "take_pct": take_pct,
+        "long_usdt": out["long_usdt"],
+        "short_usdc": out["short_usdc"],
     })
 
 
