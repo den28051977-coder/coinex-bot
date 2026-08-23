@@ -780,6 +780,74 @@ def manual_close():
     return jsonify({"ok": True, "result": result})
 
 
+@app.route("/straddle", methods=["POST", "OPTIONS"])
+def open_straddle():
+    """
+    Синхронное открытие обеих ног стрэддла (лонг USDT + шорт USDC).
+    Обе ноги уходят параллельно потоками — цена не успевает разъехаться.
+    Тело: {"base":"SOL","amount":0.5}  (amount опционален, иначе calc_lot_size)
+    Защита токеном ?token=xxx как у /webhook.
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if request.args.get("token", "") != WEBHOOK_TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(silent=True) or {}
+    base = str(data.get("base", "SOL")).upper()
+    sym_usdt = base + "USDT"
+    sym_usdc = base + "USDC"
+
+    # размер: явный amount или расчёт из депозита
+    amt = data.get("amount", None)
+    if amt is None or float(amt) <= 0:
+        amt = calc_lot_size(sym_usdt, "straddle")
+    amt = round(float(amt), 3)
+    if amt <= 0:
+        return jsonify({"ok": False, "error": "не удалось определить размер"}), 400
+
+    # обе ноги параллельно, чтобы цены входа совпали
+    results = {}
+    def leg(symbol, side, key):
+        try:
+            results[key] = place_order(symbol, side, amt)
+        except Exception as e:
+            results[key] = {"error": str(e)}
+
+    t1 = threading.Thread(target=leg, args=(sym_usdt, "buy",  "long_usdt"))
+    t2 = threading.Thread(target=leg, args=(sym_usdc, "sell", "short_usdc"))
+    t1.start(); t2.start()
+    t1.join(timeout=15); t2.join(timeout=15)
+
+    # оценка успеха каждой ноги (CoinEx code==0 = ок)
+    def ok(r): return isinstance(r, dict) and r.get("code") == 0
+    long_ok  = ok(results.get("long_usdt"))
+    short_ok = ok(results.get("short_usdc"))
+
+    status = "both_open" if (long_ok and short_ok) else \
+             "partial"   if (long_ok or short_ok)  else "failed"
+
+    # ПРЕДУПРЕЖДЕНИЕ о голой ноге при частичном исполнении
+    warning = None
+    if status == "partial":
+        open_leg = "USDT-лонг" if long_ok else "USDC-шорт"
+        warning = ("⚠ ЧАСТИЧНОЕ ИСПОЛНЕНИЕ: открылась только нога " + open_leg +
+                   ". Вторая нога не прошла (проверь баланс/стакан). "
+                   "Ты в НЕхеджированной позиции — закрой открытую ногу вручную или добери вторую!")
+
+    log_signal({"action": "straddle_open", "symbol": base,
+                "signal": "straddle_" + status}, results)
+
+    return jsonify({
+        "ok": status == "both_open",
+        "status": status,
+        "base": base, "amount": amt,
+        "long_usdt": results.get("long_usdt"),
+        "short_usdc": results.get("short_usdc"),
+        "warning": warning
+    })
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"Сервер запущен на порту {port}")
