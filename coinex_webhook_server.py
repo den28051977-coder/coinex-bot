@@ -1,965 +1,1031 @@
-"""
-CoinEx Futures Webhook Server v8.1
-Изменения vs v8 (git):
-- ИСПРАВЛЕН log_signal: вернут потерянный заголовок функции (был NameError на каждом вебхуке)
-- Удалена мёртвая вторая копия (старый v7), которая висела после app.run()
-- Персистентный CSV-лог по источникам (TRADE_LOG_CSV) — для анализа EV по signal
-- Дедуп одинаковых алертов от двух пирамид (DEDUP_SEC, 0 = выкл)
-- Reconcile guardian от биржи при потере состояния (GUARDIAN_RECONCILE)
-"""
+/* =====================================================================
+   Hedge-Range v2 — мульти-биржевой funding-релей
+   ---------------------------------------------------------------------
+   Что делает:
+     Опрашивает 5 бирж (Bybit, OKX, Bitget, MEXC, CoinEx) по обеим
+     сторонам (USDT-перп и USDC-перп) и отдаёт таблицу перекоса
+     funding: netEdge = fundingUSDC − fundingUSDT.
+     Чем жирнее netEdge — тем выгоднее там стрэддл.
 
-import os, hmac, hashlib, time, json, csv, requests, threading
-from flask import Flask, request, jsonify
-from collections import deque
-from datetime import datetime, timezone
+   ЗАПУСК:
+     1. Node.js 22+ (нужен нативный fetch). Проверка: node -v
+     2. В терминале, из этой папки:  node relay-v2.js
+     3. Открой в браузере: http://localhost:8788/
+     4. Стоп: Ctrl + C
 
-app = Flask(__name__)
+   НЕ ЗАВИСИТ от текущего relay.js — свой процесс, свой порт (8788).
+   Зависимостей нет — только встроенные модули Node 22+.
+   ===================================================================== */
 
-@app.after_request
-def add_cors(response):
-    response.headers['Access-Control-Allow-Origin'] = '*'
-    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
-    return response
+"use strict";
 
-@app.route('/signals', methods=['OPTIONS'])
-def signals_options():
-    return '', 204
+const http = require("http");
+const fs   = require("fs");
+const path = require("path");
 
-# ─── Конфигурация ───
-API_KEY        = os.environ.get("COINEX_API_KEY", "")
-API_SECRET     = os.environ.get("COINEX_API_SECRET", "")
-WEBHOOK_TOKEN  = os.environ.get("WEBHOOK_TOKEN", "mytoken123")
-LEVERAGE       = int(os.environ.get("LEVERAGE", "10"))
+const PORT = 8788;
+const HOST = "127.0.0.1";
+const HTML_FILE = path.join(__dirname, "hedge-v2.html");
 
-DEPOSIT        = float(os.environ.get("DEPOSIT", "1000"))
-LOT_PCT        = float(os.environ.get("LOT_PCT", "1.6"))
-LOT_SIZE_FIXED = float(os.environ.get("LOT_SIZE", "0"))
+/* ────────────────────────────────────────────────────────────────────
+   keys.env — конфигурация торговли (порт из coinex_webhook_server.py)
+   Все параметры опциональны. Без ключей CoinEx торговые эндпоинты
+   вернут "нет ключей" — просмотр funding/свечей продолжает работать.
+   ──────────────────────────────────────────────────────────────────── */
+function loadEnv() {
+  try {
+    const p = path.join(__dirname, "keys.env");
+    if (!fs.existsSync(p)) return false;
+    for (const line of fs.readFileSync(p, "utf8").split(/\r?\n/)) {
+      const s = line.trim();
+      if (!s || s.startsWith("#")) continue;
+      const i = s.indexOf("=");
+      if (i < 0) continue;
+      const k = s.slice(0, i).trim();
+      let v = s.slice(i + 1).trim();
+      if ((v[0] === '"' && v.endsWith('"')) || (v[0] === "'" && v.endsWith("'"))) {
+        v = v.slice(1, -1);
+      }
+      if (!process.env[k]) process.env[k] = v;
+    }
+    return true;
+  } catch (e) { return false; }
+}
+loadEnv();
 
-MAX_LOSS_PCT     = float(os.environ.get("MAX_LOSS_PCT", "3.0"))
-GUARDIAN_ENABLED = os.environ.get("GUARDIAN", "true").lower() == "true"
-GUARDIAN_INTERVAL = int(os.environ.get("GUARDIAN_INTERVAL", "30"))  # секунды
+// ─── Railway (torговый прокси) ─────────────────────────────────────
+// Ключи CoinEx лежат на Railway, туда IP-whitelist. Локальный релей
+// не хранит ключи — он проксирует все торговые вызовы на Railway.
+const RAILWAY_URL   = process.env.RAILWAY_URL || "https://coinex-bot-production.up.railway.app";
+const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || "mytoken123"; // такой же как в Railway Variables
+const LEVERAGE      = +(process.env.LEVERAGE || 10);            // только для отображения; реально на Railway
 
-# ─── Новое: лог, дедуп, reconcile ───
-TRADE_LOG_CSV      = os.environ.get("TRADE_LOG_CSV", "trades_log.csv")
-DEDUP_SEC          = float(os.environ.get("DEDUP_SEC", "4"))          # 0 = дедуп выкл
-GUARDIAN_RECONCILE = os.environ.get("GUARDIAN_RECONCILE", "true").lower() == "true"
+// funding обновляется биржей раз в 8ч, кэш на 30с достаточно чтобы
+// не долбить их API и не ловить rate-limit при частых refresh фронта
+const CACHE = new Map(); // key = `${ex}:${base}:${quote}` → {val,ts}
+const CACHE_TTL_MS = 30_000;
 
-# ─── Telegram ───
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
-TELEGRAM_ENABLED   = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+/* ────────────────────────────────────────────────────────────────────
+   HTTP helpers
+   ──────────────────────────────────────────────────────────────────── */
 
-BASE_URL = "https://api.coinex.com"
-signals_log = deque(maxlen=200)
-market_state = None  # последний heartbeat от Pine (живая методичка): цена/зоны/уровни/дельты
-
-# Защита от гонок: guardian-поток и webhook могут писать лог одновременно
-_log_lock    = threading.Lock()
-# Состояние дедупа последнего действия
-_last_action = {"key": "", "ts": 0.0}
-
-# ─── Состояние позиции ───
-position_state = {
-    "symbol":  "SOLUSDT",
-    "dir":     0,       # 1=long, -1=short, 0=flat
-    "avg":     0.0,
-    "lots":    0,
-    "avwap_tp": 0.0,
-    "signal":  "",      # откуда вход: checklist / judas_asia / frank_judas / whale_abs / ...
-    "power":   0,       # сила сигнала 1/2/3
-    "zone":    "",      # disc_15m / prem_15m / eq_15m
+function fetchTO(url, ms = 8000, opts = {}) {
+  const c = new AbortController();
+  const t = setTimeout(() => c.abort(), ms);
+  return fetch(url, { signal: c.signal, cache: "no-store", ...opts })
+    .finally(() => clearTimeout(t));
 }
 
-# ─── Типы сигналов и их приоритет ───
-SIGNAL_TYPES = {
-    "checklist":       {"risk": 1.0, "label": "Чеклист"},
-    "judas_asia":      {"risk": 1.0, "label": "Judas Asia"},
-    "frank_judas":     {"risk": 1.0, "label": "Frank Judas"},
-    "level_judas":     {"risk": 0.8, "label": "Level Judas"},
-    "avwap_judas":     {"risk": 1.0, "label": "AVWAP Judas"},
-    "avwap_breakout":  {"risk": 1.0, "label": "AVWAP Break"},
-    "of_lf_zone":      {"risk": 1.0, "label": "OF+LF Zone"},
-    "whale_abs":       {"risk": 1.2, "label": "Кит+АБС"},   # чуть крупнее лот
+async function jget(url, ms = 8000) {
+  const r = await fetchTO(url, ms);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
 }
 
-# Колонки CSV-лога (фиксированный набор, лишние ключи игнорируются)
-CSV_FIELDS = ["time", "action", "signal", "signal_label", "zone", "zone_h1", "zone_h4", "trend",
-              "delta_day", "delta_range", "last_extreme", "week_hi", "week_lo", "pwh", "pwl",
-              "avwap", "pdh", "pdl",
-              "power", "lots", "avg", "filled_price", "pnl", "loss_pct",
-              "source", "result"]
+/* ────────────────────────────────────────────────────────────────────
+   Биржевые фетчеры funding
+   Каждая функция принимает (base, quote) → { rate, nextFundingTime, mark }
+   quote: 'USDT' | 'USDC'
+   Ошибка — throw. rate в долях (например 0.0001 = 0.01% за расчёт).
+   ──────────────────────────────────────────────────────────────────── */
 
+// ─── Bybit ────────────────────────────────────────────────────────
+// USDT-linear: symbol = {BASE}USDT       (category=linear)
+// USDC-linear: symbol = {BASE}PERP       (Perpetual USDC — уникальный формат)
+async function fundBybit(base, quote) {
+  const sym = quote === "USDT" ? base + "USDT" : base + "PERP";
+  const j = await jget(`https://api.bybit.com/v5/market/tickers?category=linear&symbol=${sym}`);
+  if (j.retCode !== 0) throw new Error(j.retMsg || "bybit err");
+  const t = j.result?.list?.[0];
+  if (!t) throw new Error("no data");
+  const fr = +t.fundingRate;
+  if (!isFinite(fr)) throw new Error("nan");
+  return {
+    rate: fr,
+    nextFundingTime: +t.nextFundingTime || null,
+    mark: +t.markPrice || null,
+  };
+}
 
-def send_telegram(text):
-    """Отправляет сообщение в Telegram. Не бросает исключения наружу —
-    если Telegram не настроен или недоступен, просто логирует ошибку
-    в консоль и продолжает работу бота (торговля не должна зависеть
-    от доступности Telegram)."""
-    if not TELEGRAM_ENABLED:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        resp = requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML"
-        }, timeout=5)
-        if resp.status_code != 200:
-            print(f"  [TELEGRAM] Ошибка отправки: {resp.status_code} {resp.text}")
-    except Exception as e:
-        print(f"  [TELEGRAM] Исключение при отправке: {e}")
+// ─── OKX ──────────────────────────────────────────────────────────
+// USDT SWAP: instId = {BASE}-USDT-SWAP
+// USDC SWAP: instId = {BASE}-USDC-SWAP  (доступно не для всех монет)
+async function fundOkx(base, quote) {
+  const inst = `${base}-${quote}-SWAP`;
+  const j = await jget(`https://www.okx.com/api/v5/public/funding-rate?instId=${inst}`);
+  if (j.code !== "0") throw new Error(j.msg || "okx err");
+  const d = j.data?.[0];
+  if (!d) throw new Error("no data");
+  const fr = +d.fundingRate;
+  if (!isFinite(fr)) throw new Error("nan");
+  return {
+    rate: fr,
+    nextFundingTime: +d.nextFundingTime || null,
+    mark: null,
+  };
+}
 
+// ─── Bitget ───────────────────────────────────────────────────────
+// v2 mix: symbol = {BASE}{QUOTE}, productType = usdt-futures | usdc-futures
+async function fundBitget(base, quote) {
+  const productType = quote === "USDT" ? "usdt-futures" : "usdc-futures";
+  const sym = `${base}${quote}`;
+  const j = await jget(`https://api.bitget.com/api/v2/mix/market/current-fund-rate?symbol=${sym}&productType=${productType}`);
+  if (j.code !== "00000") throw new Error(j.msg || "bitget err");
+  const d = Array.isArray(j.data) ? j.data[0] : j.data;
+  const fr = +(d?.fundingRate ?? d?.rate);
+  if (!isFinite(fr)) throw new Error("nan");
+  return { rate: fr, nextFundingTime: null, mark: null };
+}
 
-def f_signal_label(signal):
-    return SIGNAL_TYPES.get(signal, {"label": signal}).get("label", signal)
+// ─── MEXC ─────────────────────────────────────────────────────────
+// contract: symbol = {BASE}_{QUOTE}  (XRP_USDT / XRP_USDC)
+async function fundMexc(base, quote) {
+  const sym = `${base}_${quote}`;
+  const j = await jget(`https://contract.mexc.com/api/v1/contract/funding_rate/${sym}`);
+  if (!j.success) throw new Error(j.message || j.msg || "mexc err");
+  const fr = +j.data?.fundingRate;
+  if (!isFinite(fr)) throw new Error("nan");
+  return {
+    rate: fr,
+    nextFundingTime: +j.data?.nextSettleTime || null,
+    mark: null,
+  };
+}
 
+// ─── CoinEx ───────────────────────────────────────────────────────
+// v2 futures: market = {BASE}{QUOTE}  (XRPUSDT / XRPUSDC)
+async function fundCoinex(base, quote) {
+  const sym = `${base}${quote}`;
+  const j = await jget(`https://api.coinex.com/v2/futures/funding-rate?market=${sym}`);
+  if (j.code !== 0) throw new Error(j.message || "coinex err");
+  const d = Array.isArray(j.data) ? j.data[0] : j.data;
+  const fr = +(d?.latest_funding_rate ?? d?.funding_rate ?? d?.next_funding_rate);
+  if (!isFinite(fr)) throw new Error("nan");
+  return { rate: fr, nextFundingTime: null, mark: null };
+}
 
-def _csv_append(entry):
-    """Дописывает строку в CSV-лог. Никогда не бросает наружу — сбой записи
-    лога не должен влиять на торговлю."""
-    try:
-        new_file = not os.path.exists(TRADE_LOG_CSV)
-        with open(TRADE_LOG_CSV, "a", newline="", encoding="utf-8") as fh:
-            w = csv.DictWriter(fh, fieldnames=CSV_FIELDS, extrasaction="ignore")
-            if new_file:
-                w.writeheader()
-            w.writerow(entry)
-    except Exception as e:
-        print(f"  [CSV] Ошибка записи: {e}")
+const EXCHANGES = {
+  bybit:  fundBybit,
+  okx:    fundOkx,
+  bitget: fundBitget,
+  mexc:   fundMexc,
+  coinex: fundCoinex,
+};
 
+/* ────────────────────────────────────────────────────────────────────
+   Свечи (Bybit v5 kline linear USDT) — для расчёта ATR-ренжа
+   Одной биржи достаточно: цена везде почти одинаковая, а funding
+   мы уже собираем со всех отдельно.
+   ──────────────────────────────────────────────────────────────────── */
 
-def log_signal(data, result, filled_price=None, extra=None):
-    sig = data.get("signal", "")
-    sig_info = SIGNAL_TYPES.get(sig, {"label": sig})
-    entry = {
-        "time":         datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "action":       data.get("action", ""),
-        "symbol":       data.get("symbol", ""),
-        "lots":         data.get("lots", 1),
-        "power":        data.get("power", ""),
-        "signal":       sig,
-        "signal_label": sig_info.get("label", sig),
-        "zone":         data.get("zone", ""),
-        "zone_h1":      data.get("zone_h1", ""),
-        "zone_h4":      data.get("zone_h4", ""),
-        "trend":        data.get("trend", ""),
-        "delta_day":    data.get("delta_day", ""),
-        "delta_range":  data.get("delta_range", ""),
-        "last_extreme": data.get("last_extreme", ""),
-        "week_hi":      data.get("week_hi", ""),
-        "week_lo":      data.get("week_lo", ""),
-        "pwh":          data.get("pwh", ""),
-        "pwl":          data.get("pwl", ""),
-        "avwap":        data.get("avwap", ""),
-        "pdh":          data.get("pdh", ""),
-        "pdl":          data.get("pdl", ""),
-        "avg":          data.get("avg", ""),
-        "filled_price": filled_price,
-        "result":       "ok" if isinstance(result, dict) and result.get("code") == 0 else str(result.get("msg", result) if isinstance(result, dict) else result),
-        "pnl":          None
+const CANDLE_CACHE = new Map(); // `${base}:${interval}:${limit}` → {val,ts}
+const CANDLE_TTL_MS = 60_000;   // свечи 15m обновлять раз в минуту достаточно
+
+// Bybit kline: [start, open, high, low, close, volume, turnover] — newest first
+async function fetchCandlesBybit(base, interval = "15", limit = 300) {
+  const sym = base + "USDT";
+  const j = await jget(
+    `https://api.bybit.com/v5/market/kline?category=linear&symbol=${sym}&interval=${interval}&limit=${limit}`
+  );
+  if (j.retCode !== 0) throw new Error(j.retMsg || "bybit kline err");
+  const list = j.result?.list || [];
+  return list.slice().reverse().map(k => ({
+    t: +k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5],
+  }));
+}
+
+async function getCandles(base, interval = "15", limit = 300) {
+  const key = `${base}:${interval}:${limit}`;
+  const cached = CANDLE_CACHE.get(key);
+  if (cached && Date.now() - cached.ts < CANDLE_TTL_MS) return cached.val;
+  try {
+    const v = await fetchCandlesBybit(base, interval, limit);
+    CANDLE_CACHE.set(key, { val: v, ts: Date.now() });
+    return v;
+  } catch (e) {
+    CANDLE_CACHE.set(key, { val: null, ts: Date.now(), err: String(e.message || e) });
+    return null;
+  }
+}
+
+/* ────────────────────────────────────────────────────────────────────
+   Кэш + сборка таблицы
+   ──────────────────────────────────────────────────────────────────── */
+
+async function getFunding(ex, base, quote) {
+  const key = `${ex}:${base}:${quote}`;
+  const cached = CACHE.get(key);
+  if (cached && Date.now() - cached.ts < CACHE_TTL_MS) return cached.val;
+  try {
+    const v = await EXCHANGES[ex](base, quote);
+    CACHE.set(key, { val: v, ts: Date.now() });
+    return v;
+  } catch (e) {
+    const v = { rate: null, error: String(e.message || e) };
+    CACHE.set(key, { val: v, ts: Date.now() });
+    return v;
+  }
+}
+
+// { [base]: { [ex]: { usdt, usdc, netEdge, err?, usdtNext, usdcNext } } }
+async function scanFundingMulti(bases) {
+  const out = {};
+  const tasks = [];
+  for (const base of bases) {
+    out[base] = {};
+    for (const ex of Object.keys(EXCHANGES)) {
+      out[base][ex] = { usdt: null, usdc: null, netEdge: null };
+      tasks.push((async () => {
+        const [u, c] = await Promise.all([
+          getFunding(ex, base, "USDT"),
+          getFunding(ex, base, "USDC"),
+        ]);
+        out[base][ex].usdt = u.rate;
+        out[base][ex].usdc = c.rate;
+        const errs = [u.error, c.error].filter(Boolean);
+        if (errs.length) out[base][ex].err = errs.join(" | ");
+        if (u.rate != null && c.rate != null) {
+          out[base][ex].netEdge = c.rate - u.rate;
+        }
+        out[base][ex].usdtNext = u.nextFundingTime || null;
+        out[base][ex].usdcNext = c.nextFundingTime || null;
+        if (u.mark != null || c.mark != null) {
+          out[base][ex].mark = u.mark ?? c.mark;
+        }
+      })());
     }
-    if extra:
-        entry.update(extra)
-    if isinstance(result, dict) and result.get("code") == 0:
-        pnl = result.get("data", {}).get("realized_pnl")
-        if pnl:
-            entry["pnl"] = float(pnl)
-        fp = result.get("data", {}).get("last_filled_price")
-        if fp:
-            entry["filled_price"] = float(fp)
-    with _log_lock:
-        signals_log.append(entry)
-        _csv_append(entry)
+  }
+  await Promise.allSettled(tasks);
+  return out;
+}
 
+/* ────────────────────────────────────────────────────────────────────
+   Railway proxy — торговые вызовы идут на coinex_webhook_server.py
+   (там ключи, там IP-whitelist CoinEx). Локальный релей ничего сам
+   не подписывает и в CoinEx напрямую не ходит.
+   Эндпоинты Railway:
+     POST /straddle?token=X        {base, amount}
+     POST /straddle-tpsl?token=X   {base, stop_pct, take_pct, entry_usdt?, entry_usdc?}
+     POST /close?token=X&symbol=Y
+     GET  /position/{symbol}
+   ──────────────────────────────────────────────────────────────────── */
 
-def sign_request(method, path, body=""):
-    timestamp = str(int(time.time() * 1000))
-    sign_str  = method.upper() + path + body + timestamp
-    signature = hmac.new(
-        API_SECRET.encode("utf-8"),
-        sign_str.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest()
-    return {
-        "X-COINEX-KEY":       API_KEY,
-        "X-COINEX-SIGN":      signature,
-        "X-COINEX-TIMESTAMP": timestamp,
-        "Content-Type":       "application/json",
+const round6 = x => Math.round(x * 1e6) / 1e6;
+
+async function railwayPost(apiPath, payload, token, extraQuery = "") {
+  const sep = apiPath.includes("?") ? "&" : "?";
+  const url = RAILWAY_URL + apiPath + sep + "token=" + encodeURIComponent(token)
+              + (extraQuery ? "&" + extraQuery : "");
+  const r = await fetchTO(url, 15000, {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify(payload || {}),
+  });
+  const j = await r.json().catch(() => ({ error: "bad json", status: r.status }));
+  console.log(`  POST Railway${apiPath} → ${r.status}: ${JSON.stringify(j).slice(0,200)}`);
+  return j;
+}
+
+async function railwayGet(apiPath) {
+  const r = await fetchTO(RAILWAY_URL + apiPath, 10000, { method: "GET" });
+  const j = await r.json().catch(() => ({}));
+  return j;
+}
+
+// Открыть стрэддл (обе ноги market): возвращает {ok, status, long_usdt, short_usdc, warning}
+async function railwayOpenStraddle(base, amount, token) {
+  return railwayPost("/straddle", { base, amount }, token);
+}
+
+// TP/SL на обе ноги по процентам (зеркально): entry_usdt/usdc опциональны
+async function railwayStraddleTpsl(base, stopPct, takePct, token, entries = {}) {
+  const payload = { base, stop_pct: stopPct, take_pct: takePct };
+  if (entries.entryUsdt) payload.entry_usdt = entries.entryUsdt;
+  if (entries.entryUsdc) payload.entry_usdc = entries.entryUsdc;
+  return railwayPost("/straddle-tpsl", payload, token);
+}
+
+// Закрыть одну позицию по символу (BASE+QUOTE)
+async function railwayClose(base, quote, token) {
+  const symbol = base + quote;
+  return railwayPost(`/close?symbol=${symbol}`, {}, token);
+}
+
+// Прочитать позицию (публичный GET, без токена)
+async function railwayGetPosition(base, quote) {
+  const symbol = base + quote;
+  const j = await railwayGet(`/position/${symbol}`);
+  return j.position || null;
+}
+
+async function railwayGetPositionEntry(base, quote) {
+  const p = await railwayGetPosition(base, quote);
+  if (!p) return 0;
+  for (const k of ["avg_entry_price", "entry_price", "open_price", "avg_price"]) {
+    if (p[k]) {
+      const v = +p[k];
+      if (v > 0) return v;
+    }
+  }
+  return 0;
+}
+
+async function railwayHealthCheck() {
+  try {
+    const j = await railwayGet("/");
+    return { ok: true, server: j.server || "unknown" };
+  } catch (e) {
+    return { ok: false, error: String(e.message || e) };
+  }
+}
+
+/* ────────────────────────────────────────────────────────────────────
+   ATR-walkRange (порт из hedge-v2.html) — для state-machine автомата
+   ──────────────────────────────────────────────────────────────────── */
+
+function computeTR(candles) {
+  const trs = new Array(candles.length).fill(null);
+  for (let i = 1; i < candles.length; i++) {
+    const c = candles[i], p = candles[i - 1];
+    trs[i] = Math.max(c.h - c.l, Math.abs(c.h - p.c), Math.abs(c.l - p.c));
+  }
+  return trs;
+}
+function computeAtrRma(candles, len) {
+  const trs = computeTR(candles);
+  const out = new Array(candles.length).fill(null);
+  let atr = null;
+  for (let i = 1; i < candles.length; i++) {
+    if (i < len) continue;
+    if (atr == null) {
+      let s = 0;
+      for (let j = i - len + 1; j <= i; j++) s += trs[j];
+      atr = s / len;
+    } else {
+      atr = (atr * (len - 1) + trs[i]) / len;
+    }
+    out[i] = atr;
+  }
+  return out;
+}
+function computeSmaSeries(arr, period) {
+  const out = new Array(arr.length).fill(null);
+  const q = []; let sum = 0;
+  for (let i = 0; i < arr.length; i++) {
+    const v = arr[i];
+    if (v == null) continue;
+    q.push(v); sum += v;
+    if (q.length > period) sum -= q.shift();
+    if (q.length === period) out[i] = sum / period;
+  }
+  return out;
+}
+function walkRange(candles, opts = {}) {
+  const atrLen   = opts.atrLen   || 200;
+  const smaLen   = opts.smaLen   || 100;
+  const multi    = opts.multi    || 4;
+  const maxOut   = opts.maxOut   || 100;
+  const startBar = opts.startBar || 301;
+
+  const atrs = computeAtrRma(candles, atrLen);
+  const atrSmooth = computeSmaSeries(atrs, smaLen);
+  const n = candles.length;
+  const state = new Array(n).fill(null);
+  const events = [];
+  let value = null, upper = null, lower = null, upperMid = null, lowerMid = null;
+  let count = 0, justReset = false;
+
+  for (let i = 0; i < n; i++) {
+    const c = candles[i];
+    const atrW = atrSmooth[i] != null ? atrSmooth[i] * multi : null;
+
+    if (value == null) {
+      if (i >= startBar && atrW != null) {
+        const hl2 = (c.h + c.l) / 2;
+        value = hl2; upper = hl2 + atrW; lower = hl2 - atrW;
+        upperMid = (value + upper) / 2; lowerMid = (value + lower) / 2;
+        state[i] = { value, upper, lower, upperMid, lowerMid };
+        justReset = true;
+      }
+      continue;
     }
 
+    const p = candles[i - 1];
+    const crossUp = p && p.l <= upper && c.l >  upper;
+    const crossDn = p && p.h >= lower && c.h <  lower;
 
-def api_post(path, payload):
-    full_path = "/v2" + path
-    body      = json.dumps(payload, separators=(",", ":"))
-    headers   = sign_request("POST", full_path, body)
-    r = requests.post(BASE_URL + full_path, headers=headers, data=body, timeout=10)
-    print(f"  POST {full_path} → {r.status_code}: {r.text[:300]}")
-    return r.json()
+    if (c.l > upper || c.h < lower) count++;
 
+    const doReset = crossUp || crossDn || count >= maxOut;
+    if (doReset) {
+      if (crossUp) events.push({ bar: i, type: "reset-up", price: upper });
+      if (crossDn) events.push({ bar: i, type: "reset-dn", price: lower });
+      count = 0;
+      if (atrW != null) {
+        const hl2 = (c.h + c.l) / 2;
+        value = hl2; upper = hl2 + atrW; lower = hl2 - atrW;
+        upperMid = (value + upper) / 2; lowerMid = (value + lower) / 2;
+      }
+      justReset = true;
+    } else {
+      justReset = false;
+    }
+    state[i] = { value, upper, lower, upperMid, lowerMid, reset: doReset };
+  }
+  let cur = null;
+  for (let i = n - 1; i >= 0; i--) { if (state[i]) { cur = state[i]; break; } }
+  const last = candles[n - 1];
+  const range = cur ? {
+    upper: cur.upper, lower: cur.lower, mid: cur.value,
+    upperMid: cur.upperMid, lowerMid: cur.lowerMid,
+    width: (cur.upper - cur.lower) / 2,
+    close: last.c, posPct: (last.c - cur.lower) / (cur.upper - cur.lower),
+  } : null;
+  return { state, events, range };
+}
 
-def api_get(path, params=None):
-    import urllib.parse
-    query     = urllib.parse.urlencode(params or {})
-    full_path = "/v2" + path + ("?" + query if query else "")
-    headers   = sign_request("GET", full_path, "")
-    r = requests.get(BASE_URL + full_path, headers=headers, timeout=10)
-    print(f"  GET {full_path} → {r.status_code}: {r.text[:300]}")
-    return r.json()
+/* ────────────────────────────────────────────────────────────────────
+   State-machine автомата стрэддла
+   States: WAIT_BREAK → WAIT_MID → STRADDLE_OPEN → SINGLE_LEG → DONE
+   ──────────────────────────────────────────────────────────────────── */
 
+const CYCLES = new Map(); // id → cycle
+let cycleSeq = 0;
 
-def get_current_price(symbol):
-    try:
-        r = api_get("/spot/ticker", {"market": symbol})
-        if r.get("code") == 0:
-            data = r.get("data", [])
-            if isinstance(data, list) and len(data) > 0:
-                return float(data[0].get("last", 0))
-        r2 = api_get("/futures/ticker", {"market": symbol})
-        if r2.get("code") == 0:
-            data2 = r2.get("data", [])
-            if isinstance(data2, list) and len(data2) > 0:
-                return float(data2[0].get("last", 0))
-    except Exception as e:
-        print(f"  [WARN] get_current_price error: {e}")
-    return 0.0
+function newCycleId(base, ex) {
+  cycleSeq++;
+  return `${base}-${ex}-${Date.now().toString(36)}-${cycleSeq}`;
+}
 
+function cycleLog(cycle, type, msg, data) {
+  if (!cycle.events) cycle.events = [];
+  const e = { ts: Date.now(), type, msg };
+  if (data) e.data = data;
+  cycle.events.push(e);
+  if (cycle.events.length > 100) cycle.events.shift();
+  cycle.updatedAt = Date.now();
+  console.log(`  [cycle ${cycle.base}/${cycle.ex}] ${cycle.state} · ${type}: ${msg}`);
+}
 
-# ─────────────────────────────────────────────────────────────
-#  МОДУЛЬ УРОВНЕЙ (Binance — там ликвидность SOL)
-#  День: PDH/PDL/DO · Неделя вс→вс: Week Hi/Lo, PWH/PWL, WO
-#  Кэш 15 мин (уровни медленные, API не дёргаем часто)
-# ─────────────────────────────────────────────────────────────
-import time as _time
-from datetime import datetime, timezone, timedelta
+function captureRange(st) {
+  return {
+    upper: st.upper, lower: st.lower, mid: st.value,
+    upperMid: st.upperMid, lowerMid: st.lowerMid,
+    width: (st.upper - st.lower) / 2,
+  };
+}
 
-_levels_cache = {"ts": 0, "data": None}
-_LEVELS_TTL = 15 * 60  # 15 минут
+async function openStraddleInternal(base, amount, token) {
+  // Railway делает оба ордера параллельно внутри своим тредингом
+  const j = await railwayOpenStraddle(base, amount, token);
+  // Railway ответ: {ok, status:"both_open|partial|failed", long_usdt, short_usdc, warning}
+  await new Promise(r => setTimeout(r, 700)); // задержка на прописывание позиции
+  const entryUsdt = j.status === "both_open" || j.long_usdt?.code === 0
+                    ? await railwayGetPositionEntry(base, "USDT").catch(() => 0) : 0;
+  const entryUsdc = j.status === "both_open" || j.short_usdc?.code === 0
+                    ? await railwayGetPositionEntry(base, "USDC").catch(() => 0) : 0;
+  return { status: j.status || "failed", entryUsdt, entryUsdc, raw: j };
+}
 
-def get_binance_klines(symbol="SOLUSDT", interval="1d", limit=60):
-    """Свечи с Binance (публичный API, без подписи). [[openTime,o,h,l,c,v,closeTime,...]]"""
-    try:
-        url = "https://api.binance.com/api/v3/klines"
-        r = requests.get(url, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=10)
-        if r.status_code == 200:
-            return r.json()
-        print(f"  [LEVELS] binance klines {interval} → HTTP {r.status_code}")
-    except Exception as e:
-        print(f"  [LEVELS] klines error: {e}")
-    return []
+async function evaluateCycle(cycle) {
+  const cs = await getCandles(cycle.base, cycle.tf, 500);
+  if (!cs || cs.length < 305) return;
+  const walk = walkRange(cs);
+  const price = cs[cs.length - 1].c;
+  cycle.lastPrice = price;
 
-def _week_start_sunday(ts):
-    """Timestamp начала крипто-недели (воскресенье 00:00 UTC) для данного ts."""
-    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-    days_since_sunday = (dt.weekday() + 1) % 7  # Вс=0, Пн=1..Сб=6
-    ws = dt.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days_since_sunday)
-    return int(ws.timestamp())
-
-def calc_levels(symbol="SOLUSDT"):
-    """Считает уровни день/неделя. Кэш 15 мин."""
-    now = _time.time()
-    if _levels_cache["data"] is not None and (now - _levels_cache["ts"]) < _LEVELS_TTL:
-        return _levels_cache["data"]
-
-    out = {"updated": int(now)}
-    # дневные свечи (последние 70 дней — хватит на дни/недели вс→вс)
-    days = get_binance_klines(symbol, "1d", 70)
-    if days and len(days) >= 2:
-        # [openTime(ms),o,h,l,c,v,...]; последняя свеча = сегодня (формируется)
-        def H(k): return float(k[2])
-        def L(k): return float(k[3])
-        def O(k): return float(k[1])
-        # ДЕНЬ
-        out["DO"]  = O(days[-1])           # открытие сегодня
-        out["PDH"] = H(days[-2])           # вчерашний high
-        out["PDL"] = L(days[-2])           # вчерашний low
-        # НЕДЕЛЯ вс→вс — группируем дневные свечи по крипто-неделям
-        cur_ws = _week_start_sunday(int(days[-1][0] / 1000))
-        prev_ws = cur_ws - 7 * 86400
-        cur_days, prev_days = [], []
-        for k in days:
-            kt = int(k[0] / 1000)
-            kws = _week_start_sunday(kt)
-            if kws == cur_ws:
-                cur_days.append(k)
-            elif kws == prev_ws:
-                prev_days.append(k)
-        if cur_days:
-            out["week_hi"] = max(H(k) for k in cur_days)
-            out["week_lo"] = min(L(k) for k in cur_days)
-            out["WO"]      = O(cur_days[0])    # открытие недели (воскресенье)
-        if prev_days:
-            out["PWH"] = max(H(k) for k in prev_days)
-            out["PWL"] = min(L(k) for k in prev_days)
-
-    _levels_cache["data"] = out
-    _levels_cache["ts"] = now
-    print(f"  [LEVELS] обновлены: {out}")
-    return out
-
-
-def calc_lot_size(symbol, signal=""):
-    if LOT_SIZE_FIXED > 0:
-        return LOT_SIZE_FIXED
-    price = get_current_price(symbol)
-    if price <= 0:
-        print(f"  [WARN] Не удалось получить цену, fallback 0.1")
-        return 0.1
-    risk_mult = SIGNAL_TYPES.get(signal, {}).get("risk", 1.0)
-    lot_usd   = DEPOSIT * (LOT_PCT / 100.0) * risk_mult
-    lot_size  = round(lot_usd / price, 3)
-    print(f"  LOT_SIZE: ${lot_usd:.2f} / {price} = {lot_size} ({signal}, risk×{risk_mult})")
-    return lot_size
-
-
-def get_position(symbol):
-    for ep in ["/futures/pending-position", "/futures/position"]:
-        r = api_get(ep, {"market": symbol, "market_type": "FUTURES"})
-        print(f"  get_position [{ep}]: {json.dumps(r)[:300]}")
-        if r.get("code") == 4009:
-            continue
-        if r.get("code") != 0:
-            return None
-        data = r.get("data", {})
-        if isinstance(data, list):
-            for p in data:
-                if p.get("market") == symbol:
-                    return p
-            return None
-        if isinstance(data, dict):
-            if data.get("market") == symbol:
-                return data
-            for key in ["position_list", "positions"]:
-                pos_list = data.get(key, [])
-                if isinstance(pos_list, list):
-                    for p in pos_list:
-                        if p.get("market") == symbol:
-                            return p
-        return None
-    return None
-
-
-def set_leverage(symbol, leverage):
-    return api_post("/futures/adjust-position-leverage", {
-        "market":      symbol,
-        "market_type": "FUTURES",
-        "leverage":    str(leverage),
-    })
-
-
-def set_position_tp(symbol, tp_price):
-    """Установить тейк-профит на текущую позицию по символу."""
-    return api_post("/futures/set-position-take-profit", {
-        "market":            symbol,
-        "market_type":       "FUTURES",
-        "take_profit_type":  "latest_price",
-        "take_profit_price": str(tp_price),
-    })
-
-
-def set_position_sl(symbol, sl_price):
-    """Установить стоп-лосс на текущую позицию по символу."""
-    return api_post("/futures/set-position-stop-loss", {
-        "market":          symbol,
-        "market_type":     "FUTURES",
-        "stop_loss_type":  "latest_price",
-        "stop_loss_price": str(sl_price),
-    })
-
-
-def place_order(symbol, side, amount):
-    set_leverage(symbol, LEVERAGE)
-    return api_post("/futures/order", {
-        "market":      symbol,
-        "market_type": "FUTURES",
-        "side":        side,
-        "type":        "market",
-        "amount":      str(amount),
-    })
-
-
-def close_position(symbol):
-    pos = get_position(symbol)
-    if not pos:
-        print(f"  [WARN] close_position: позиция {symbol} не найдена")
-        position_state["dir"]  = 0
-        position_state["avg"]  = 0.0
-        position_state["lots"] = 0
-        return {"msg": "нет открытой позиции"}
-    side   = "sell" if pos.get("side") == "long" else "buy"
-    amount = str(pos.get("close_avbl", pos.get("open_interest", pos.get("amount", "0"))))
-    print(f"  close_position: side={side} amount={amount}")
-    result = api_post("/futures/order", {
-        "market":         symbol,
-        "market_type":    "FUTURES",
-        "side":           side,
-        "type":           "market",
-        "amount":         amount,
-        "close_position": True
-    })
-    position_state["dir"]    = 0
-    position_state["avg"]    = 0.0
-    position_state["lots"]   = 0
-    position_state["signal"] = ""
-    position_state["avwap_tp"] = 0.0
-    return result
-
-
-def _reconcile_from_exchange(symbol):
-    """Если состояние потеряно (рестарт/рассинхрон), но на бирже есть позиция —
-    восстанавливаем dir/avg, чтобы guardian мог защитить. Только при надёжной
-    цене входа (>0); иначе ничего не делаем (безопасный no-op)."""
-    try:
-        pos = get_position(symbol)
-        if not pos:
-            return
-        side = pos.get("side")
-        ep = None
-        for k in ("avg_entry_price", "entry_price", "open_price", "settle_price", "avg_price"):
-            v = pos.get(k)
-            if v:
-                try:
-                    ep = float(v)
-                except (TypeError, ValueError):
-                    ep = None
-                if ep and ep > 0:
-                    break
-        if side in ("long", "short") and ep and ep > 0:
-            position_state["dir"] = 1 if side == "long" else -1
-            position_state["avg"] = ep
-            print(f"  [GUARDIAN RECONCILE] восстановлено: dir={position_state['dir']} avg={ep}")
-    except Exception as e:
-        print(f"  [GUARDIAN RECONCILE ERROR] {e}")
-
-
-def guardian_check(symbol, source="webhook"):
-    if not GUARDIAN_ENABLED or MAX_LOSS_PCT <= 0:
-        return
-    # Reconcile: состояние пустое, но позиция на бирже есть → восстановим
-    if GUARDIAN_RECONCILE and (position_state["dir"] == 0 or position_state["avg"] <= 0):
-        _reconcile_from_exchange(symbol)
-    if position_state["dir"] == 0 or position_state["avg"] <= 0:
-        return
-    try:
-        price = get_current_price(symbol)
-        if price <= 0:
-            return
-        avg = position_state["avg"]
-        if position_state["dir"] == 1:
-            loss_pct = (avg - price) / avg * 100
-        else:
-            loss_pct = (price - avg) / avg * 100
-
-        if loss_pct >= MAX_LOSS_PCT:
-            print(f"  [GUARDIAN/{source}] Убыток {loss_pct:.2f}% >= {MAX_LOSS_PCT}% — закрываю")
-            result = close_position(symbol)
-            log_signal(
-                {"action": "guardian_close", "symbol": symbol, "avg": str(avg), "signal": position_state.get("signal", "")},
-                result,
-                extra={"loss_pct": round(loss_pct, 2), "source": source}
-            )
-            return
-
-        # AVWAP TP
-        avwap_tp = position_state.get("avwap_tp", 0)
-        if avwap_tp > 0:
-            if position_state["dir"] == 1 and price >= avwap_tp and avg < avwap_tp:
-                print(f"  [AVWAP TP/{source}] Цена {price} >= AVWAP {avwap_tp} — закрываю лонг")
-                result = close_position(symbol)
-                log_signal({"action": "avwap_tp", "symbol": symbol, "avg": str(avg), "signal": position_state.get("signal", "")}, result)
-            elif position_state["dir"] == -1 and price <= avwap_tp and avg > avwap_tp:
-                print(f"  [AVWAP TP/{source}] Цена {price} <= AVWAP {avwap_tp} — закрываю шорт")
-                result = close_position(symbol)
-                log_signal({"action": "avwap_tp", "symbol": symbol, "avg": str(avg), "signal": position_state.get("signal", "")}, result)
-    except Exception as e:
-        print(f"  [GUARDIAN ERROR] {e}")
-
-
-# ─── Фоновый поток Guardian ───
-def guardian_loop():
-    print(f"[GUARDIAN] Фоновый поток запущен, интервал={GUARDIAN_INTERVAL}с")
-    while True:
-        time.sleep(GUARDIAN_INTERVAL)
-        try:
-            symbol = position_state.get("symbol", "SOLUSDT")
-            guardian_check(symbol, source="background")
-        except Exception as e:
-            print(f"  [GUARDIAN LOOP ERROR] {e}")
-
-if GUARDIAN_ENABLED:
-    t = threading.Thread(target=guardian_loop, daemon=True)
-    t.start()
-
-
-def _is_duplicate(action, signal, data, lots):
-    """True, если такой же алерт пришёл в окне DEDUP_SEC (защита от двух
-    пирамид/двойного flip+breakout на одной свече). Мутирует _last_action."""
-    if DEDUP_SEC <= 0:
-        return False
-    dkey = f"{action}:{signal}:{data.get('avg','')}:{lots}:{data.get('reason','')}"
-    now_ts = time.time()
-    if dkey == _last_action["key"] and (now_ts - _last_action["ts"]) < DEDUP_SEC:
-        return True
-    _last_action["key"] = dkey
-    _last_action["ts"]  = now_ts
-    return False
-
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    if request.args.get("token", "") != WEBHOOK_TOKEN:
-        return jsonify({"error": "unauthorized"}), 401
-
-    data = request.get_json(silent=True)
-    if not data:
-        return jsonify({"error": "no json"}), 400
-
-    action = data.get("action", "").lower()
-    symbol = data.get("symbol", "SOLUSDT").upper()
-
-    # ── HEARTBEAT: факты рынка раз в бар (живая методичка) ──
-    # Не торгует, не пишет в signals_log — только обновляет market_state.
-    if action == "heartbeat":
-        global market_state
-        market_state = {
-            "updated":      int(time.time()),
-            "price":        data.get("price", ""),
-            "zone":         data.get("zone", ""),
-            "zone_h1":      data.get("zone_h1", ""),
-            "zone_h4":      data.get("zone_h4", ""),
-            "week_hi":      data.get("week_hi", ""),
-            "week_lo":      data.get("week_lo", ""),
-            "pwh":          data.get("pwh", ""),
-            "pwl":          data.get("pwl", ""),
-            "pdh":          data.get("pdh", ""),
-            "pdl":          data.get("pdl", ""),
-            "avwap":        data.get("avwap", ""),
-            "delta_day":    data.get("delta_day", ""),
-            "delta_sess":   data.get("delta_sess", ""),
-            "delta_range":  data.get("delta_range", ""),
-            "last_extreme": data.get("last_extreme", ""),
-            "trend":        data.get("trend", ""),
-            "came_from":    data.get("came_from", ""),
-            "btc_conflict": data.get("btc_conflict", 0),
-            "wk_profile":   data.get("wk_profile", ""),
-            "dp_profile":   data.get("dp_profile", ""),
-            "dp_plan":      data.get("dp_plan", ""),
+  switch (cycle.state) {
+    case "WAIT_BREAK": {
+      // Ищем reset-up/reset-dn НОВЕЕ момента запуска цикла
+      const resets = walk.events.filter(e =>
+        cs[e.bar] && cs[e.bar].t >= cycle.createdAt &&
+        (e.type === "reset-up" || e.type === "reset-dn")
+      );
+      if (resets.length > 0) {
+        const r = resets[resets.length - 1]; // самый свежий
+        const st = walk.state[r.bar];
+        if (st) {
+          cycle.triggerRange = captureRange(st);
+          cycle.resetType    = r.type;
+          cycle.resetTime    = cs[r.bar].t;
+          cycle.state        = "WAIT_MID";
+          cycleLog(cycle, "transition", `WAIT_BREAK → WAIT_MID (${r.type}, mid=${cycle.triggerRange.mid.toFixed(6)})`);
         }
-        return jsonify({"ok": True, "heartbeat": True})
-
-    lots   = int(data.get("lots", 1))
-    power  = int(data.get("power", 1))
-    signal = data.get("signal", "checklist")
-
-    # ── Дедуп одинаковых алертов от двух пирамид ──
-    if action in ("buy", "sell", "close_all", "reverse", "unload") and _is_duplicate(action, signal, data, lots):
-        print(f"  [DEDUP] Пропуск дубля: {action}/{signal}/avg={data.get('avg','')}/lots={lots}")
-        log_signal(data, {"msg": "deduped"}, extra={"source": "dedup"})
-        return jsonify({"ok": True, "deduped": True})
-
-    lot_size = calc_lot_size(symbol, signal)
-    amount   = round(lot_size * lots, 3)
-
-    print(f"\n[{time.strftime('%H:%M:%S')}] ACTION={action} | {symbol} | lots={lots} | power={power} | signal={signal} | amount={amount} | zone={data.get('zone','')} | zone_h1={data.get('zone_h1','')} | trend={data.get('trend','')} | dDay={data.get('delta_day','')} | dRange={data.get('delta_range','')} | lExt={data.get('last_extreme','')}")
-
-    # Guardian перед действием
-    guardian_check(symbol, source="pre-webhook")
-
-    result = {"msg": "no action"}
-
-    if action == "buy":
-        pos = get_position(symbol)
-        if pos and pos.get("side") == "short":
-            print(f"  [INFO] Открыт шорт — закрываем перед лонгом")
-            close_position(symbol)
-        result = place_order(symbol, "buy", amount)
-        if isinstance(result, dict) and result.get("code") == 0:
-            fp = result.get("data", {}).get("last_filled_price")
-            avg_val = float(data.get("avg", 0) or 0)
-            entry_price = avg_val if avg_val > 0 else float(fp or 0)
-            position_state.update({
-                "dir":      1,
-                "avg":      entry_price,
-                "lots":     lots,
-                "symbol":   symbol,
-                "signal":   signal,
-                "power":    power,
-                "zone":     data.get("zone", ""),
-                "avwap_tp": float(data.get("avwap_mid", 0) or 0),
-            })
-            send_telegram(
-                f"🟢 <b>ЛОНГ открыт</b>\n"
-                f"Символ: {symbol}\n"
-                f"Лоты: {lots} | Сила: {power}\n"
-                f"Сигнал: {f_signal_label(signal)}\n"
-                f"Цена входа: {entry_price:.4f}\n"
-                f"Зона: {data.get('zone','—')}"
-            )
-
-    elif action == "sell":
-        pos = get_position(symbol)
-        if pos and pos.get("side") == "long":
-            print(f"  [INFO] Открыт лонг — закрываем перед шортом")
-            close_position(symbol)
-        result = place_order(symbol, "sell", amount)
-        if isinstance(result, dict) and result.get("code") == 0:
-            fp = result.get("data", {}).get("last_filled_price")
-            avg_val = float(data.get("avg", 0) or 0)
-            entry_price = avg_val if avg_val > 0 else float(fp or 0)
-            position_state.update({
-                "dir":      -1,
-                "avg":      entry_price,
-                "lots":     lots,
-                "symbol":   symbol,
-                "signal":   signal,
-                "power":    power,
-                "zone":     data.get("zone", ""),
-                "avwap_tp": float(data.get("avwap_mid", 0) or 0),
-            })
-            send_telegram(
-                f"🔴 <b>ШОРТ открыт</b>\n"
-                f"Символ: {symbol}\n"
-                f"Лоты: {lots} | Сила: {power}\n"
-                f"Сигнал: {f_signal_label(signal)}\n"
-                f"Цена входа: {entry_price:.4f}\n"
-                f"Зона: {data.get('zone','—')}"
-            )
-
-    elif action == "close_all":
-        old_dir  = position_state.get("dir", 0)
-        old_avg  = position_state.get("avg", 0.0)
-        old_lots = position_state.get("lots", 0)
-        cur_price = get_current_price(symbol)
-        result = close_position(symbol)
-        if old_dir != 0 and old_avg > 0 and cur_price:
-            pnl_pct = (cur_price - old_avg) / old_avg * 100 * old_dir
-            emoji = "✅" if pnl_pct >= 0 else "❌"
-            send_telegram(
-                f"{emoji} <b>Позиция закрыта</b>\n"
-                f"Символ: {symbol}\n"
-                f"Направление: {'ЛОНГ' if old_dir == 1 else 'ШОРТ'}\n"
-                f"Лоты: {old_lots}\n"
-                f"Причина: {data.get('reason', data.get('signal',''))}\n"
-                f"PnL: {pnl_pct:+.2f}%"
-            )
-        else:
-            send_telegram(f"ℹ️ Закрытие позиции {symbol} (причина: {data.get('reason', data.get('signal',''))})")
-
-    elif action == "reverse":
-        # Атомарный разворот — закрыть старую и открыть новую
-        print(f"  [REVERSE] Закрываем текущую позицию и открываем в другую сторону")
-        close_position(symbol)
-        # Направление определяем по полю trend или lots_closed
-        new_side = data.get("new_side", "")
-        if new_side in ("buy", "sell"):
-            result = place_order(symbol, new_side, amount)
-            if isinstance(result, dict) and result.get("code") == 0:
-                fp = result.get("data", {}).get("last_filled_price")
-                avg_val = float(data.get("avg", 0) or 0)
-                entry_price = avg_val if avg_val > 0 else float(fp or 0)
-                position_state.update({
-                    "dir":      1 if new_side == "buy" else -1,
-                    "avg":      entry_price,
-                    "lots":     lots,
-                    "symbol":   symbol,
-                    "signal":   signal,
-                    "power":    power,
-                    "zone":     data.get("zone", ""),
-                    "avwap_tp": float(data.get("avwap_mid", 0) or 0),
-                })
-                send_telegram(
-                    f"🔄 <b>РАЗВОРОТ</b>\n"
-                    f"Символ: {symbol}\n"
-                    f"Новое направление: {'ЛОНГ' if new_side == 'buy' else 'ШОРТ'}\n"
-                    f"Лоты: {lots} | Сила: {power}\n"
-                    f"Сигнал: {f_signal_label(signal)}\n"
-                    f"Цена входа: {entry_price:.4f}"
-                )
-        else:
-            result = {"msg": "reverse: нет new_side"}
-
-    elif action == "unload":
-        pos = get_position(symbol)
-        if pos:
-            side   = "sell" if pos["side"] == "long" else "buy"
-            result = place_order(symbol, side, lot_size)
-            if isinstance(result, dict) and result.get("code") == 0:
-                position_state["lots"] = max(0, position_state["lots"] - 1)
-        else:
-            result = {"msg": "нет позиции для выгрузки"}
-
-    elif action in ("trend", "guardian_close", "avwap_tp"):
-        # Информационные события — только логируем
-        print(f"  [INFO] Событие {action} — только лог")
-        result = {"msg": f"logged: {action}"}
-
-    elif action == "info":
-        # Информационный сигнал без торгового действия (например,
-        # обеденный разворот NY Lunch Judas) — только уведомление в Telegram
-        note = data.get("note", "")
-        level = data.get("level", "")
-        price = data.get("price", "")
-        print(f"  [INFO] {signal}: {note}")
-        send_telegram(
-            f"📢 <b>{f_signal_label(signal)}</b>\n"
-            f"{note}\n"
-            f"Уровень: {level} | Цена: {price}"
-        )
-        result = {"msg": f"info logged: {signal}"}
-
-    else:
-        return jsonify({"error": f"unknown action: {action}"}), 400
-
-    print(f"  ИТОГ: {result}")
-    log_signal(data, result)
-    return jsonify({"ok": True, "result": result})
-
-
-@app.route("/", methods=["GET"])
-def health():
-    pos = get_position("SOLUSDT")
-    return jsonify({
-        "status":   "ok",
-        "server":   "CoinEx Webhook v8.1",
-        "position": pos,
-        "state":    position_state,
-        "config": {
-            "deposit":          DEPOSIT,
-            "lot_pct":          LOT_PCT,
-            "leverage":         LEVERAGE,
-            "lot_fixed":        LOT_SIZE_FIXED,
-            "max_loss_pct":     MAX_LOSS_PCT,
-            "guardian":         GUARDIAN_ENABLED,
-            "guardian_interval": GUARDIAN_INTERVAL,
-            "guardian_reconcile": GUARDIAN_RECONCILE,
-            "dedup_sec":        DEDUP_SEC,
-            "trade_log_csv":    TRADE_LOG_CSV,
+      }
+      break;
+    }
+    case "WAIT_MID": {
+      // Railway не поддерживает limit-ордера, поэтому используем touch-then-market:
+      // ждём когда цена коснётся mid ±толеранс → market-ордер на обе ноги через Railway
+      const tr  = cycle.triggerRange;
+      const tol = tr.width * (cycle.midTolerancePct || 0.05); // дефолт 5% от полу-ширины
+      if (Math.abs(price - tr.mid) < tol) {
+        cycleLog(cycle, "trigger", `price=${price.toFixed(6)} near mid=${tr.mid.toFixed(6)} (tol=${tol.toFixed(6)})`);
+        const result = await openStraddleInternal(cycle.base, cycle.amount, cycle.token);
+        if (result.status === "both_open") {
+          cycle.entryUsdt  = result.entryUsdt;
+          cycle.entryUsdc  = result.entryUsdc;
+          cycle.entryTime  = Date.now();
+          cycle.entryPrice = price;
+          cycle.state      = "STRADDLE_OPEN";
+          cycleLog(cycle, "entry", `Straddle открыт через Railway · long USDT@${result.entryUsdt} · short USDC@${result.entryUsdc}`);
+        } else if (result.status === "partial") {
+          cycle.state = "ERROR";
+          cycleLog(cycle, "error", `Partial fill! ${result.raw?.warning || ''}`, result);
+        } else {
+          cycle.state = "ERROR";
+          cycleLog(cycle, "error", `Straddle failed: ${result.status}`, result);
         }
-    })
+      }
+      break;
+    }
+    case "STRADDLE_OPEN": {
+      // Ждём reset ПОСЛЕ входа — тот определит победившую ногу
+      const resets = walk.events.filter(e =>
+        cs[e.bar] && cs[e.bar].t >= cycle.entryTime &&
+        (e.type === "reset-up" || e.type === "reset-dn")
+      );
+      if (resets.length > 0) {
+        const r      = resets[0]; // первый сброс после входа
+        const winner = r.type === "reset-up" ? "usdt" : "usdc";
+        const loser  = winner === "usdt" ? "usdc" : "usdt";
+        const loserQ = loser === "usdt" ? "USDT" : "USDC";
 
+        cycleLog(cycle, "second_break", `${r.type} → закрываю лузера=${loser}, оставляю winner=${winner}`);
+        // Закрываем лузера через Railway
+        try { await railwayClose(cycle.base, loserQ, cycle.token); }
+        catch (e) { cycleLog(cycle, "warn", `close loser failed: ${e.message}`); }
 
-@app.route("/position/<symbol>", methods=["GET"])
-def check_position(symbol):
-    pos = get_position(symbol.upper())
-    return jsonify({"position": pos, "state": position_state})
+        const entry   = winner === "usdt" ? cycle.entryUsdt : cycle.entryUsdc;
+        const tpFrac  = cycle.tpPct / 100;
+        const tpPrice = winner === "usdt" ? entry * (1 + tpFrac) : entry * (1 - tpFrac);
 
-
-@app.route("/state", methods=["GET"])
-def state():
-    # Живое состояние рынка из heartbeat (Pine раз в бар). None если heartbeat ещё не пришёл.
-    return jsonify(market_state or {"waiting": "no heartbeat yet"})
-
-
-@app.route("/levels", methods=["GET"])
-def levels():
-    # Уровни из heartbeat (свежие, не зависят от входов). Фолбэк — последний вход из лога.
-    if market_state:
-        return jsonify({k: market_state.get(k) for k in
-                        ("week_hi", "week_lo", "pwh", "pwl", "pdh", "pdl", "avwap", "updated")})
-    out = {"source": "pine_payload"}
-    try:
-        for s in reversed(signals_log):
-            for k in ("week_hi", "week_lo", "pwh", "pwl"):
-                if k not in out and s.get(k) not in (None, ""):
-                    out[k] = s.get(k)
-            if all(k in out for k in ("week_hi", "week_lo", "pwh", "pwl")):
-                break
-    except Exception as e:
-        out["error"] = str(e)
-    return jsonify(out)
-
-
-@app.route("/signals", methods=["GET"])
-def get_signals():
-    limit   = int(request.args.get("limit", 50))
-    signals = list(signals_log)[-limit:]
-    signals.reverse()
-    return jsonify({"count": len(signals), "signals": signals})
-
-
-@app.route("/guardian", methods=["GET"])
-def guardian_status():
-    symbol = request.args.get("symbol", "SOLUSDT").upper()
-    guardian_check(symbol, source="manual")
-    return jsonify({
-        "state":        position_state,
-        "guardian":     GUARDIAN_ENABLED,
-        "max_loss_pct": MAX_LOSS_PCT,
-        "interval_sec": GUARDIAN_INTERVAL,
-    })
-
-
-@app.route("/close", methods=["POST"])
-def manual_close():
-    """Ручное закрытие позиции через POST /close?token=xxx"""
-    if request.args.get("token", "") != WEBHOOK_TOKEN:
-        return jsonify({"error": "unauthorized"}), 401
-    symbol = request.args.get("symbol", "SOLUSDT").upper()
-    result = close_position(symbol)
-    log_signal({"action": "manual_close", "symbol": symbol, "signal": "manual"}, result)
-    return jsonify({"ok": True, "result": result})
-
-
-@app.route("/straddle", methods=["POST", "OPTIONS"])
-def open_straddle():
-    """
-    Синхронное открытие обеих ног стрэддла (лонг USDT + шорт USDC).
-    Обе ноги уходят параллельно потоками — цена не успевает разъехаться.
-    Тело: {"base":"SOL","amount":0.5}  (amount опционален, иначе calc_lot_size)
-    Защита токеном ?token=xxx как у /webhook.
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
-    if request.args.get("token", "") != WEBHOOK_TOKEN:
-        return jsonify({"error": "unauthorized"}), 401
-
-    data = request.get_json(silent=True) or {}
-    base = str(data.get("base", "SOL")).upper()
-    sym_usdt = base + "USDT"
-    sym_usdc = base + "USDC"
-
-    # размер: явный amount или расчёт из депозита
-    amt = data.get("amount", None)
-    if amt is None or float(amt) <= 0:
-        amt = calc_lot_size(sym_usdt, "straddle")
-    amt = round(float(amt), 3)
-    if amt <= 0:
-        return jsonify({"ok": False, "error": "не удалось определить размер"}), 400
-
-    # обе ноги параллельно, чтобы цены входа совпали
-    results = {}
-    def leg(symbol, side, key):
-        try:
-            results[key] = place_order(symbol, side, amt)
-        except Exception as e:
-            results[key] = {"error": str(e)}
-
-    t1 = threading.Thread(target=leg, args=(sym_usdt, "buy",  "long_usdt"))
-    t2 = threading.Thread(target=leg, args=(sym_usdc, "sell", "short_usdc"))
-    t1.start(); t2.start()
-    t1.join(timeout=15); t2.join(timeout=15)
-
-    # оценка успеха каждой ноги (CoinEx code==0 = ок)
-    def ok(r): return isinstance(r, dict) and r.get("code") == 0
-    long_ok  = ok(results.get("long_usdt"))
-    short_ok = ok(results.get("short_usdc"))
-
-    status = "both_open" if (long_ok and short_ok) else \
-             "partial"   if (long_ok or short_ok)  else "failed"
-
-    # ПРЕДУПРЕЖДЕНИЕ о голой ноге при частичном исполнении
-    warning = None
-    if status == "partial":
-        open_leg = "USDT-лонг" if long_ok else "USDC-шорт"
-        warning = ("⚠ ЧАСТИЧНОЕ ИСПОЛНЕНИЕ: открылась только нога " + open_leg +
-                   ". Вторая нога не прошла (проверь баланс/стакан). "
-                   "Ты в НЕхеджированной позиции — закрой открытую ногу вручную или добери вторую!")
-
-    log_signal({"action": "straddle_open", "symbol": base,
-                "signal": "straddle_" + status}, results)
-
-    return jsonify({
-        "ok": status == "both_open",
-        "status": status,
-        "base": base, "amount": amt,
-        "long_usdt": results.get("long_usdt"),
-        "short_usdc": results.get("short_usdc"),
-        "warning": warning
-    })
-
-
-@app.route("/straddle-tpsl", methods=["POST", "OPTIONS"])
-def straddle_tpsl():
-    """
-    Выставить стоп/тейк на ОБЕ ноги стрэддла по процентам из сетапа.
-    Тело: {"base":"XRP", "stop_pct":0.6, "take_pct":0.77,
-           "entry_usdt":1.493, "entry_usdc":1.493}   (entry опционально — иначе с позиции)
-    Стоп/тейк зеркальны: лонг USDT и шорт USDC считаются в разные стороны.
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
-    if request.args.get("token", "") != WEBHOOK_TOKEN:
-        return jsonify({"error": "unauthorized"}), 401
-
-    data = request.get_json(silent=True) or {}
-    base = str(data.get("base", "SOL")).upper()
-    sym_usdt = base + "USDT"
-    sym_usdc = base + "USDC"
-    try:
-        stop_pct = float(data.get("stop_pct", 0))
-        take_pct = float(data.get("take_pct", 0))
-    except (TypeError, ValueError):
-        return jsonify({"ok": False, "error": "неверные проценты"}), 400
-    if stop_pct <= 0 or take_pct <= 0:
-        return jsonify({"ok": False, "error": "stop_pct/take_pct должны быть > 0"}), 400
-
-    # цены входа: из тела или с позиции на бирже
-    def entry_of(symbol, explicit):
-        v = data.get(explicit)
-        if v:
-            try:
-                fv = float(v)
-                if fv > 0:
-                    return fv
-            except (TypeError, ValueError):
-                pass
-        pos = get_position(symbol)
-        if pos:
-            for k in ("avg_entry_price", "entry_price", "open_price", "avg_price"):
-                if pos.get(k):
-                    try:
-                        return float(pos[k])
-                    except (TypeError, ValueError):
-                        pass
-        return 0.0
-
-    e_usdt = entry_of(sym_usdt, "entry_usdt")
-    e_usdc = entry_of(sym_usdc, "entry_usdc")
-
-    sf = stop_pct / 100.0
-    tf = take_pct / 100.0
-    out = {}
-
-    # ЛОНГ USDT: тейк выше входа, стоп ниже
-    if e_usdt > 0:
-        out["long_usdt"] = {
-            "tp": set_position_tp(sym_usdt, round(e_usdt * (1 + tf), 6)),
-            "sl": set_position_sl(sym_usdt, round(e_usdt * (1 - sf), 6)),
-            "entry": e_usdt,
+        // Хард-стоп: A2 = противоположная граница triggerRange (дефолт)
+        let slPrice = null;
+        if (cycle.slMode === "opposite" || !cycle.slMode) {
+          slPrice = winner === "usdt" ? cycle.triggerRange.lower : cycle.triggerRange.upper;
+        } else if (cycle.slMode === "mid") {
+          slPrice = cycle.triggerRange.mid;
+        } else if (cycle.slMode === "fixed" && cycle.slPct > 0) {
+          const sf = cycle.slPct / 100;
+          slPrice = winner === "usdt" ? entry * (1 - sf) : entry * (1 + sf);
         }
-    else:
-        out["long_usdt"] = {"error": "нет позиции/цены входа USDT"}
 
-    # ШОРТ USDC: тейк НИЖЕ входа, стоп ВЫШЕ (зеркально)
-    if e_usdc > 0:
-        out["short_usdc"] = {
-            "tp": set_position_tp(sym_usdc, round(e_usdc * (1 - tf), 6)),
-            "sl": set_position_sl(sym_usdc, round(e_usdc * (1 + sf), 6)),
-            "entry": e_usdc,
+        // Считаем % от entry для Railway /straddle-tpsl (принимает проценты, не абсолютные цены)
+        const takePct = cycle.tpPct;
+        let stopPct = 0;
+        if (slPrice != null) {
+          stopPct = winner === "usdt"
+            ? ((entry - slPrice) / entry) * 100
+            : ((slPrice - entry) / entry) * 100;
+          stopPct = Math.abs(stopPct);
         }
-    else:
-        out["short_usdc"] = {"error": "нет позиции/цены входа USDC"}
+        if (takePct > 0 && stopPct > 0) {
+          try {
+            // Railway /straddle-tpsl ставит и на лузера тоже — но его уже закрыли, TP/SL на nil-позиции безвредны
+            await railwayStraddleTpsl(cycle.base, stopPct, takePct, cycle.token, {
+              entryUsdt: winner === "usdt" ? entry : 0,
+              entryUsdc: winner === "usdc" ? entry : 0,
+            });
+          } catch (e) { cycleLog(cycle, "warn", `straddle-tpsl failed: ${e.message}`); }
+        }
 
-    def ok(leg):
-        return isinstance(leg, dict) and isinstance(leg.get("tp"), dict) and leg["tp"].get("code") == 0 \
-               and isinstance(leg.get("sl"), dict) and leg["sl"].get("code") == 0
-    both = ok(out.get("long_usdt")) and ok(out.get("short_usdc"))
+        cycle.winnerSide = winner;
+        cycle.keptEntry  = entry;
+        cycle.tpPrice    = tpPrice;
+        cycle.slPrice    = slPrice;
+        cycle.stopPctCalc = stopPct;
+        cycle.state      = "SINGLE_LEG";
+        cycleLog(cycle, "leg_kept", `TP=${tpPrice.toFixed(6)} (${takePct}%) · SL=${slPrice?.toFixed(6) || "нет"} (${stopPct.toFixed(2)}%)`);
+      }
+      break;
+    }
+    case "SINGLE_LEG": {
+      const winnerQ = cycle.winnerSide === "usdt" ? "USDT" : "USDC";
+      // Позиция ещё жива? (может TP или хард-SL сработал на бирже)
+      let pos = null;
+      try { pos = await railwayGetPosition(cycle.base, winnerQ); } catch { /* ignore */ }
+      if (!pos) {
+        cycle.state = "DONE";
+        cycleLog(cycle, "exit", `Позиция ${cycle.base}${winnerQ} закрыта на бирже (TP или SL сработал)`);
+        break;
+      }
+      // Мягкий триггер: обратный reset → закрываем через Railway
+      if (cycle.softStopEnabled !== false) {
+        const reverseType = cycle.winnerSide === "usdt" ? "reset-dn" : "reset-up";
+        const reverses = walk.events.filter(e =>
+          cs[e.bar] && cs[e.bar].t >= cycle.entryTime && e.type === reverseType
+        );
+        if (reverses.length > 0) {
+          try {
+            await railwayClose(cycle.base, winnerQ, cycle.token);
+            cycle.state = "DONE";
+            cycleLog(cycle, "soft_stop", `Обратный ${reverseType} → ранний выход через Railway`);
+          } catch (e) {
+            cycleLog(cycle, "error", `soft close failed: ${e.message}`);
+          }
+        }
+      }
+      break;
+    }
+  }
+}
 
-    log_signal({"action": "straddle_tpsl", "symbol": base,
-                "signal": "tpsl_" + ("ok" if both else "partial")}, out)
+// Poll loop — каждые 30 секунд оцениваем все активные циклы
+const POLL_MS = 30_000;
+setInterval(async () => {
+  for (const [id, cycle] of CYCLES) {
+    if (["DONE", "ERROR", "STOPPED"].includes(cycle.state)) continue;
+    try { await evaluateCycle(cycle); }
+    catch (e) { cycleLog(cycle, "error", `poll: ${e.message}`); }
+  }
+}, POLL_MS);
 
-    return jsonify({
-        "ok": both,
-        "base": base, "stop_pct": stop_pct, "take_pct": take_pct,
-        "long_usdt": out["long_usdt"],
-        "short_usdc": out["short_usdc"],
-    })
+/* ────────────────────────────────────────────────────────────────────
+   HTTP-сервер
+   ──────────────────────────────────────────────────────────────────── */
 
+function cors(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "*");
+}
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    print(f"Сервер запущен на порту {port}")
-    print(f"DEPOSIT={DEPOSIT}, LOT_PCT={LOT_PCT}%, LEVERAGE={LEVERAGE}x")
-    print(f"GUARDIAN={GUARDIAN_ENABLED}, MAX_LOSS={MAX_LOSS_PCT}%, INTERVAL={GUARDIAN_INTERVAL}s")
-    print(f"DEDUP_SEC={DEDUP_SEC}, RECONCILE={GUARDIAN_RECONCILE}, CSV={TRADE_LOG_CSV}")
-    app.run(host="0.0.0.0", port=port)
+function readBody(req) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    req.on("data", c => chunks.push(c));
+    req.on("end", () => {
+      try {
+        const s = Buffer.concat(chunks).toString("utf8");
+        resolve(s ? JSON.parse(s) : {});
+      } catch { resolve({}); }
+    });
+    req.on("error", () => resolve({}));
+  });
+}
+
+const server = http.createServer(async (req, res) => {
+  cors(res);
+  if (req.method === "OPTIONS") { res.writeHead(204); return res.end(); }
+
+  let u;
+  try { u = new URL(req.url, `http://${req.headers.host}`); }
+  catch { res.writeHead(400); return res.end("bad request"); }
+
+  // ── /health ─────────────────────────────────────────────────────
+  if (u.pathname === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({
+      ok: true,
+      ts: Date.now(),
+      cacheSize: CACHE.size,
+      exchanges: Object.keys(EXCHANGES),
+      trading: "railway-proxy",
+      railwayUrl: RAILWAY_URL,
+      leverage: LEVERAGE,
+      cycles: CYCLES.size,
+    }));
+  }
+
+  // ── /straddle — прокси на Railway ──────────────────────────────
+  if (u.pathname === "/straddle" && req.method === "POST") {
+    const token = u.searchParams.get("token") || "";
+    const data  = await readBody(req);
+    if (!data.base || !data.amount) {
+      res.writeHead(400); return res.end(JSON.stringify({ error: "base + amount required" }));
+    }
+    try {
+      const j = await railwayOpenStraddle(data.base.toUpperCase(), +data.amount, token);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify(j));
+    } catch (e) {
+      res.writeHead(502); return res.end(JSON.stringify({ error: "railway: " + e.message }));
+    }
+  }
+
+  // ── /straddle-tpsl — прокси на Railway ─────────────────────────
+  if (u.pathname === "/straddle-tpsl" && req.method === "POST") {
+    const token = u.searchParams.get("token") || "";
+    const data  = await readBody(req);
+    if (!data.base || !data.stop_pct || !data.take_pct) {
+      res.writeHead(400); return res.end(JSON.stringify({ error: "base + stop_pct + take_pct required" }));
+    }
+    try {
+      const j = await railwayStraddleTpsl(
+        data.base.toUpperCase(),
+        +data.stop_pct,
+        +data.take_pct,
+        token,
+        { entryUsdt: +data.entry_usdt || 0, entryUsdc: +data.entry_usdc || 0 }
+      );
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify(j));
+    } catch (e) {
+      res.writeHead(502); return res.end(JSON.stringify({ error: "railway: " + e.message }));
+    }
+  }
+
+  // ── /leg-close — прокси на Railway/close (для usdt/usdc/both) ──
+  if (u.pathname === "/leg-close" && req.method === "POST") {
+    const token = u.searchParams.get("token") || "";
+    const data  = await readBody(req);
+    const base  = String(data.base || "").toUpperCase();
+    const which = String(data.side || "").toLowerCase();
+    const quotes = [];
+    if (which === "usdt" || which === "both") quotes.push("USDT");
+    if (which === "usdc" || which === "both") quotes.push("USDC");
+    if (!base || !quotes.length) {
+      res.writeHead(400); return res.end(JSON.stringify({ error: "base + side=usdt|usdc|both required" }));
+    }
+    const results = {};
+    for (const q of quotes) {
+      try { results[base + q] = await railwayClose(base, q, token); }
+      catch (e) { results[base + q] = { error: String(e.message || e) }; }
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ base, results }));
+  }
+
+  // ══════════════════════════════════════════════════════════════════
+  //  АВТОМАТ СТРЭДДЛА (state machine cycles)
+  // ══════════════════════════════════════════════════════════════════
+
+  // ── POST /cycle/start ──────────────────────────────────────────
+  if (u.pathname === "/cycle/start" && req.method === "POST") {
+    if (u.searchParams.get("token") !== WEBHOOK_TOKEN) {
+      res.writeHead(401); return res.end(JSON.stringify({ error: "unauthorized" }));
+    }
+    const data = await readBody(req);
+    const base = String(data.base || "").toUpperCase();
+    const ex   = String(data.ex || "coinex").toLowerCase();
+    const amount = +data.amount || 0;
+    const tpPct  = +data.tpPct  || 1.0;
+    const tf     = String(data.tf || "15");
+    if (!base || amount <= 0) {
+      res.writeHead(400);
+      return res.end(JSON.stringify({ error: "base + amount required" }));
+    }
+    // Один активный цикл на (base, ex)
+    for (const c of CYCLES.values()) {
+      if (c.base === base && c.ex === ex && !["DONE", "ERROR", "STOPPED"].includes(c.state)) {
+        res.writeHead(409);
+        return res.end(JSON.stringify({ error: "уже активен цикл на " + base + "/" + ex, id: c.id }));
+      }
+    }
+    const cycle = {
+      id: newCycleId(base, ex),
+      base, ex, tf,
+      amount, tpPct,
+      slMode:  data.slMode || "opposite",   // "opposite" | "mid" | "fixed" | "none"
+      slPct:   +data.slPct || 0,
+      midTolerancePct: +data.midTolerancePct || 0.05,
+      softStopEnabled: data.softStopEnabled !== false,
+      token: u.searchParams.get("token"),   // сохраняем токен для последующих Railway вызовов
+      state: "WAIT_BREAK",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      events: [],
+    };
+    CYCLES.set(cycle.id, cycle);
+    cycleLog(cycle, "start", `Автомат запущен · TF=${tf} · amount=${amount} · TP=${tpPct}% · SL=${cycle.slMode}`);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: true, cycle }));
+  }
+
+  // ── GET /cycles ────────────────────────────────────────────────
+  if (u.pathname === "/cycles") {
+    const list = [...CYCLES.values()].sort((a, b) => b.createdAt - a.createdAt);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ts: Date.now(), cycles: list }));
+  }
+
+  // ── GET /cycle?id=… ────────────────────────────────────────────
+  if (u.pathname === "/cycle") {
+    const id = u.searchParams.get("id");
+    const cycle = CYCLES.get(id);
+    if (!cycle) { res.writeHead(404); return res.end('{"error":"not found"}'); }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ cycle }));
+  }
+
+  // ── POST /cycle/stop ───────────────────────────────────────────
+  // Останавливает цикл. Если closePositions=true — закрывает позиции если есть
+  if (u.pathname === "/cycle/stop" && req.method === "POST") {
+    if (u.searchParams.get("token") !== WEBHOOK_TOKEN) {
+      res.writeHead(401); return res.end(JSON.stringify({ error: "unauthorized" }));
+    }
+    const data = await readBody(req);
+    const cycle = CYCLES.get(data.id);
+    if (!cycle) { res.writeHead(404); return res.end('{"error":"cycle not found"}'); }
+    const closeAll = data.closePositions !== false;
+    const results = { closes: {} };
+    const useToken = data.token || cycle.token;
+    if (closeAll) {
+      for (const q of ["USDT", "USDC"]) {
+        try { results.closes[cycle.base + q] = await railwayClose(cycle.base, q, useToken); }
+        catch (e) { results.closes[cycle.base + q] = { error: String(e.message || e) }; }
+      }
+    }
+    cycle.state = "STOPPED";
+    cycleLog(cycle, "stop", `Manual stop · closePositions=${closeAll}`, results);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: true, cycle, results }));
+  }
+
+  // ── POST /cycle/update-tp ─ обновить TP на активной ноге ────────
+  if (u.pathname === "/cycle/update-tp" && req.method === "POST") {
+    if (u.searchParams.get("token") !== WEBHOOK_TOKEN) {
+      res.writeHead(401); return res.end(JSON.stringify({ error: "unauthorized" }));
+    }
+    const data = await readBody(req);
+    const cycle = CYCLES.get(data.id);
+    if (!cycle) { res.writeHead(404); return res.end('{"error":"cycle not found"}'); }
+    const newTp = +data.tpPct;
+    if (!(newTp > 0)) { res.writeHead(400); return res.end('{"error":"tpPct required"}'); }
+    cycle.tpPct = newTp;
+    let result = null;
+    if (cycle.state === "SINGLE_LEG" && cycle.winnerSide && cycle.keptEntry) {
+      const useToken = data.token || cycle.token;
+      const entry    = cycle.keptEntry;
+      const tf       = newTp / 100;
+      const tpPrice  = cycle.winnerSide === "usdt" ? entry * (1 + tf) : entry * (1 - tf);
+      // Railway ставит /straddle-tpsl на обе ноги. Лузер уже закрыт — TP на nil-позиции безвреден
+      const stopPct  = cycle.stopPctCalc || 0.5; // если есть текущий SL — сохраним, иначе 0.5%
+      try {
+        result = await railwayStraddleTpsl(cycle.base, stopPct, newTp, useToken, {
+          entryUsdt: cycle.winnerSide === "usdt" ? entry : 0,
+          entryUsdc: cycle.winnerSide === "usdc" ? entry : 0,
+        });
+        cycle.tpPrice = tpPrice;
+        cycleLog(cycle, "tp_update", `New TP=${newTp}% → ${tpPrice.toFixed(6)}`, result);
+      } catch (e) {
+        cycleLog(cycle, "warn", `setTP failed: ${e.message}`);
+      }
+    } else {
+      cycleLog(cycle, "tp_update", `New TP=${newTp}% (сохранён, будет применён при закрытии лузера)`);
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: true, cycle, result }));
+  }
+
+  // ── POST /cycle/close ─ ручное закрытие ноги/обеих ─────────────
+  if (u.pathname === "/cycle/close" && req.method === "POST") {
+    if (u.searchParams.get("token") !== WEBHOOK_TOKEN) {
+      res.writeHead(401); return res.end(JSON.stringify({ error: "unauthorized" }));
+    }
+    const data  = await readBody(req);
+    const cycle = CYCLES.get(data.id);
+    if (!cycle) { res.writeHead(404); return res.end('{"error":"cycle not found"}'); }
+    const which = String(data.side || "both").toLowerCase();
+    const useToken = data.token || cycle.token;
+    const quotes = [];
+    if (which === "usdt" || which === "both") quotes.push("USDT");
+    if (which === "usdc" || which === "both") quotes.push("USDC");
+    const results = {};
+    for (const q of quotes) {
+      try { results[cycle.base + q] = await railwayClose(cycle.base, q, useToken); }
+      catch (e) { results[cycle.base + q] = { error: String(e.message || e) }; }
+    }
+    if (which === "both") {
+      cycle.state = "DONE";
+      cycleLog(cycle, "manual_close", "Both legs closed manually via Railway", results);
+    } else {
+      cycleLog(cycle, "manual_close", `${which} leg closed manually via Railway`, results);
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: true, cycle, results }));
+  }
+
+  // ── /positions?base=XRP — читаем с Railway (публичный GET) ──────
+  if (u.pathname === "/positions") {
+    const base = (u.searchParams.get("base") || "").toUpperCase();
+    if (!base) { res.writeHead(400); return res.end('{"error":"base required"}'); }
+    try {
+      const [pu, pc] = await Promise.all([
+        railwayGetPosition(base, "USDT").catch(e => ({ error: String(e.message || e) })),
+        railwayGetPosition(base, "USDC").catch(e => ({ error: String(e.message || e) })),
+      ]);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ base, long_usdt: pu, short_usdc: pc, ts: Date.now() }));
+    } catch (e) {
+      res.writeHead(500);
+      return res.end(JSON.stringify({ error: String(e.message || e) }));
+    }
+  }
+
+  // ── /funding-multi?bases=XRP,BTC,ETH — вся таблица ──────────────
+  if (u.pathname === "/funding-multi") {
+    const bases = (u.searchParams.get("bases") || "XRP,BTC,ETH,SOL,DOGE")
+      .toUpperCase().split(",").map(s => s.trim()).filter(Boolean);
+    try {
+      const data = await scanFundingMulti(bases);
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      return res.end(JSON.stringify({ ts: Date.now(), bases, data }));
+    } catch (e) {
+      res.writeHead(500);
+      return res.end(JSON.stringify({ error: String(e.message || e) }));
+    }
+  }
+
+  // ── /funding-one?base=XRP&ex=bybit&quote=USDT — одна точка ──────
+  // Для отладки: посмотреть что именно возвращает биржа
+  if (u.pathname === "/funding-one") {
+    const base  = (u.searchParams.get("base")  || "XRP").toUpperCase();
+    const ex    = (u.searchParams.get("ex")    || "bybit").toLowerCase();
+    const quote = (u.searchParams.get("quote") || "USDT").toUpperCase();
+    if (!EXCHANGES[ex]) {
+      res.writeHead(400);
+      return res.end(JSON.stringify({ error: `unknown exchange: ${ex}` }));
+    }
+    const v = await getFunding(ex, base, quote);
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    return res.end(JSON.stringify({ ex, base, quote, ...v, ts: Date.now() }));
+  }
+
+  // ── /candles?base=XRP&interval=15&limit=300 ─────────────────────
+  if (u.pathname === "/candles") {
+    const base = (u.searchParams.get("base") || "").toUpperCase();
+    const interval = u.searchParams.get("interval") || "15";
+    const limit = Math.min(1000, +u.searchParams.get("limit") || 300);
+    if (!base) { res.writeHead(400); return res.end('{"error":"base required"}'); }
+    const cs = await getCandles(base, interval, limit);
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    return res.end(JSON.stringify({ base, interval, candles: cs || [], count: cs?.length || 0 }));
+  }
+
+  // ── /candles-multi?bases=XRP,BTC&interval=15 — параллельно ──────
+  if (u.pathname === "/candles-multi") {
+    const bases = (u.searchParams.get("bases") || "")
+      .toUpperCase().split(",").map(s => s.trim()).filter(Boolean);
+    const interval = u.searchParams.get("interval") || "15";
+    const limit = Math.min(1000, +u.searchParams.get("limit") || 300);
+    if (!bases.length) { res.writeHead(400); return res.end('{"error":"bases required"}'); }
+    const pairs = await Promise.all(bases.map(async b => [b, await getCandles(b, interval, limit)]));
+    const out = {};
+    for (const [b, cs] of pairs) out[b] = cs || [];
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    return res.end(JSON.stringify({ ts: Date.now(), interval, bases, data: out }));
+  }
+
+  // ── / и /hedge-v2.html — отдаём фронт ───────────────────────────
+  if (u.pathname === "/" || u.pathname === "/hedge-v2.html") {
+    try {
+      const html = fs.readFileSync(HTML_FILE, "utf8");
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(html);
+    } catch {
+      res.writeHead(404);
+      return res.end("hedge-v2.html not found — положи файл рядом с relay-v2.js");
+    }
+  }
+
+  res.writeHead(404);
+  res.end("not found");
+});
+
+/* ────────────────────────────────────────────────────────────────────
+   Старт
+   ──────────────────────────────────────────────────────────────────── */
+
+if (typeof fetch !== "function") {
+  console.error("\n  ✖ Нужен Node.js 22+ (нет нативного fetch).");
+  console.error("    Проверьте:  node -v   и обновите с https://nodejs.org\n");
+  process.exit(1);
+}
+
+server.listen(PORT, HOST, () => {
+  console.log("");
+  console.log("  ✅  Hedge-Range v2 relay запущен");
+  console.log("  ─────────────────────────────────────────────────────────────");
+  console.log("  Веб:              http://" + HOST + ":" + PORT + "/");
+  console.log("  Health:           http://" + HOST + ":" + PORT + "/health");
+  console.log("  Таблица перекоса: http://" + HOST + ":" + PORT + "/funding-multi?bases=XRP,BTC,ETH,SOL");
+  console.log("  Одна точка:       http://" + HOST + ":" + PORT + "/funding-one?base=XRP&ex=bybit&quote=USDT");
+  console.log("  Свечи Bybit:      http://" + HOST + ":" + PORT + "/candles?base=XRP&interval=15&limit=300");
+  console.log("  Свечи multi:      http://" + HOST + ":" + PORT + "/candles-multi?bases=XRP,BTC&interval=15");
+  console.log("");
+  console.log("  Биржи:      " + Object.keys(EXCHANGES).join(", "));
+  console.log("  Кэш TTL:    " + (CACHE_TTL_MS / 1000) + "s");
+  console.log("");
+  console.log("  🌐 Торговля через Railway: " + RAILWAY_URL);
+  console.log("     Токен WEBHOOK_TOKEN передаётся из фронта (localStorage.hedgeV2Token)");
+  console.log("     Прокси-эндпоинты (заворачивают на Railway):");
+  console.log("       POST /straddle?token=…      → Railway /straddle");
+  console.log("       POST /straddle-tpsl?token=… → Railway /straddle-tpsl");
+  console.log("       POST /leg-close?token=…     → Railway /close (per leg)");
+  console.log("       GET  /positions?base=XRP    → Railway /position/{sym}");
+  console.log("");
+  console.log("  🤖 АВТОМАТ (state-machine стрэддла, крутится локально):");
+  console.log("     POST /cycle/start?token=…    — запустить автомат");
+  console.log("     GET  /cycles                  — список всех циклов");
+  console.log("     GET  /cycle?id=…              — один цикл");
+  console.log("     POST /cycle/stop?token=…      — остановить + закрыть позиции");
+  console.log("     POST /cycle/update-tp?token=… — изменить TP на живой ноге");
+  console.log("     POST /cycle/close?token=…     — ручное закрытие ноги");
+  console.log("     Poll: " + (POLL_MS/1000) + "s · Плечо: " + LEVERAGE + "× (реально на Railway)");
+  console.log("");
+  console.log("  Стоп: Ctrl + C");
+  console.log("");
+});
