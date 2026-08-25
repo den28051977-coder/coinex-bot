@@ -273,24 +273,43 @@ async function scanFundingMulti(bases) {
 
 const round6 = x => Math.round(x * 1e6) / 1e6;
 
+// Railway free-tier может спать и просыпаться 20-40 сек. Даём щедрый таймаут.
+const RAILWAY_TIMEOUT_MS = 45_000;
+
 async function railwayPost(apiPath, payload, token, extraQuery = "") {
   const sep = apiPath.includes("?") ? "&" : "?";
   const url = RAILWAY_URL + apiPath + sep + "token=" + encodeURIComponent(token)
               + (extraQuery ? "&" + extraQuery : "");
-  const r = await fetchTO(url, 15000, {
-    method:  "POST",
-    headers: { "Content-Type": "application/json" },
-    body:    JSON.stringify(payload || {}),
-  });
-  const j = await r.json().catch(() => ({ error: "bad json", status: r.status }));
-  console.log(`  POST Railway${apiPath} → ${r.status}: ${JSON.stringify(j).slice(0,200)}`);
-  return j;
+  try {
+    const r = await fetchTO(url, RAILWAY_TIMEOUT_MS, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify(payload || {}),
+    });
+    const j = await r.json().catch(() => ({ error: "bad json", status: r.status }));
+    console.log(`  POST Railway${apiPath} → ${r.status}: ${JSON.stringify(j).slice(0,200)}`);
+    return j;
+  } catch (e) {
+    const msg = e.name === "AbortError"
+      ? `Railway не ответил за ${RAILWAY_TIMEOUT_MS/1000}с (возможно спит — попробуй ещё раз через 30с, free-tier просыпается ~40с)`
+      : `Railway error: ${e.message}`;
+    console.log(`  POST Railway${apiPath} → ✗ ${msg}`);
+    return { error: msg };
+  }
 }
 
 async function railwayGet(apiPath) {
-  const r = await fetchTO(RAILWAY_URL + apiPath, 10000, { method: "GET" });
-  const j = await r.json().catch(() => ({}));
-  return j;
+  try {
+    const r = await fetchTO(RAILWAY_URL + apiPath, RAILWAY_TIMEOUT_MS, { method: "GET" });
+    const j = await r.json().catch(() => ({}));
+    return j;
+  } catch (e) {
+    const msg = e.name === "AbortError"
+      ? `Railway timeout (${RAILWAY_TIMEOUT_MS/1000}с) — free-tier мог заснуть, попробуй ещё раз`
+      : `Railway error: ${e.message}`;
+    console.log(`  GET Railway${apiPath} → ✗ ${msg}`);
+    return { error: msg };
+  }
 }
 
 // Открыть стрэддл (обе ноги market): возвращает {ok, status, long_usdt, short_usdc, warning}
@@ -1008,6 +1027,13 @@ server.listen(PORT, HOST, () => {
   console.log("");
   console.log("  Биржи:      " + Object.keys(EXCHANGES).join(", "));
   console.log("  Кэш TTL:    " + (CACHE_TTL_MS / 1000) + "s");
+  console.log("");
+  // Прогреваем Railway чтобы первый запрос юзера не ловил холодный старт
+  console.log("  🔥 Прогреваю Railway (может занять до 45с если сервер спал)…");
+  railwayHealthCheck().then(hc => {
+    if (hc.ok) console.log("  ✅ Railway готов: " + hc.server);
+    else console.log("  ⚠ Railway пока не отвечает (" + hc.error + "). Попробуй /positions через минуту.");
+  });
   console.log("");
   console.log("  🌐 Торговля через Railway: " + RAILWAY_URL);
   console.log("     Токен WEBHOOK_TOKEN передаётся из фронта (localStorage.hedgeV2Token)");
