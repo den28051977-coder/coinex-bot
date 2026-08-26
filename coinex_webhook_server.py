@@ -368,7 +368,7 @@ def set_position_sl(symbol, sl_price):
 
 
 def place_order(symbol, side, amount):
-    set_leverage(symbol, LEVERAGE)
+    # set_leverage(symbol, LEVERAGE)
     return api_post("/futures/order", {
         "market":      symbol,
         "market_type": "FUTURES",
@@ -376,6 +376,7 @@ def place_order(symbol, side, amount):
         "type":        "market",
         "amount":      str(amount),
     })
+
 
 
 def close_position(symbol):
