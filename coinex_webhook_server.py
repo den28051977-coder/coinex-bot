@@ -820,12 +820,21 @@ def open_straddle():
     sym_usdc = base + "USDC"
 
     # размер: явный amount или расчёт из депозита
-    amt = data.get("amount", None)
+        amt = data.get("amount", None)
     if amt is None or float(amt) <= 0:
         amt = calc_lot_size(sym_usdt, "straddle")
-    amt = round(float(amt), 3)
+    
+    # 🌟 УМНОЕ ОКРУГЛЕНИЕ: Для DOGE и мелких монет нужны целые лоты, иначе CoinEx отклонит ордер
+    if base in ["DOGE", "SHIB", "PEPE"]:
+        amt = round(float(amt), 0)  # только целые числа (например, 150 DOGE)
+    elif base in ["XRP", "ADA", "TRX"]:
+        amt = round(float(amt), 1)  # 1 знак после запятой
+    else:
+        amt = round(float(amt), 3)  # для SOL/BTC/ETH оставляем 3 знака
+        
     if amt <= 0:
         return jsonify({"ok": False, "error": "не удалось определить размер"}), 400
+
 
     # обе ноги параллельно, чтобы цены входа совпали
     results = {}
